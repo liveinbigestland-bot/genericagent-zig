@@ -52,11 +52,14 @@ pub const ToolError = error{
 // ============================================================================
 
 /// 旧版工具定义（保持与 agent/root.zig 的兼容性）
+///
+/// 当前仍然允许使用旧式定义，但 execute 已统一为新型 ToolFn 签名，
+/// 让 Legacy API 更好地和 ToolRegistry 兼容。
 pub const ToolDef = struct {
     name: []const u8,
     description: []const u8,
     parameters_schema: []const u8,
-    execute: *const fn ([]const u8, std.mem.Allocator) ToolError![]const u8,
+    execute: *const fn (ctx: *ToolContext, args: json.Value, response: []const u8) ToolResult,
 };
 
 /// 旧版注册表（保持向后兼容）

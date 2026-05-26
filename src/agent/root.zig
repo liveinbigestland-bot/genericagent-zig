@@ -226,9 +226,19 @@ pub const Agent = struct {
         try self.handler.registerTool(tool);
     }
 
+    /// 注册一个工具条目（新式 ToolEntry 接口）
+    pub fn registerToolEntry(self: *Agent, entry: tools.ToolEntry) !void {
+        try self.handler.registerToolEntry(entry);
+    }
+
     /// 批量注册工具
     pub fn registerTools(self: *Agent, tool_list: []const tools.ToolDef) !void {
         try self.handler.registerTools(tool_list);
+    }
+
+    /// 批量注册工具条目（新式 ToolEntry 接口）
+    pub fn registerToolEntries(self: *Agent, entry_list: []const tools.ToolEntry) !void {
+        try self.handler.registerToolEntries(entry_list);
     }
 
     // ----------------------------------------------------------------

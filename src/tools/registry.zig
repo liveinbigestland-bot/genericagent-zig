@@ -12,17 +12,23 @@ const json = @import("json");
 
 /// 工具执行结果
 pub const ToolResult = struct {
-    /// 返回给 LLM 的结构化数据（JSON Value）
-    data: ?json.Value = null,
+    /// 返回给 LLM 的数据
+    data: ?Data = null,
     /// 需要追加到下一轮 prompt 的文本（可选）
     next_prompt: ?[]const u8 = null,
     /// 是否要求 Agent 退出循环
     should_exit: bool = false,
 
+    /// 数据类型：可以是简单字符串或完整的 JSON Value
+    pub const Data = union(enum) {
+        text: []const u8,
+        value: json.Value,
+    };
+
     /// 创建一个仅包含文本数据的简单结果
     pub fn textResult(_: std.mem.Allocator, text: []const u8) ToolResult {
         return .{
-            .data = .{ .string = text },
+            .data = .{ .text = text },
             .should_exit = false,
         };
     }
@@ -30,7 +36,7 @@ pub const ToolResult = struct {
     /// 创建一个错误结果
     pub fn errorResult(_: std.mem.Allocator, err_msg: []const u8) ToolResult {
         return .{
-            .data = .{ .string = err_msg },
+            .data = .{ .text = err_msg },
             .should_exit = false,
         };
     }
@@ -38,14 +44,27 @@ pub const ToolResult = struct {
     /// 创建一个要求退出的结果
     pub fn exitResult(_: std.mem.Allocator, text: []const u8) ToolResult {
         return .{
-            .data = .{ .string = text },
+            .data = .{ .text = text },
             .should_exit = true,
+        };
+    }
+
+    /// 创建一个包含 JSON Value 的结果
+    pub fn jsonResult(value: json.Value) ToolResult {
+        return .{
+            .data = .{ .value = value },
+            .should_exit = false,
         };
     }
 
     /// 释放 ToolResult 持有的堆内存
     pub fn deinit(self: *ToolResult, allocator: std.mem.Allocator) void {
-        if (self.data) |*d| d.deinit(allocator);
+        if (self.data) |*d| {
+            switch (d.*) {
+                .text => allocator.free(d.text),
+                .value => {},
+            }
+        }
         if (self.next_prompt) |p| allocator.free(p);
         self.* = .{};
     }

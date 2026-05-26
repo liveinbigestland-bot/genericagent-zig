@@ -12,6 +12,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const std_json = std.json;
+const json = @import("json");
 
 const tools = @import("tools");
 const ToolDef = tools.ToolDef;
@@ -28,6 +29,8 @@ const ToolDefinition = llm.ToolDefinition;
 pub const StepOutcome = struct {
     /// 工具返回的文本结果
     result: []const u8,
+    /// 当前 result 是否由 StepOutcome 拥有，若为 true 则 deinit 时释放
+    result_owned: bool = false,
     /// 是否为错误结果
     is_error: bool = false,
     /// 是否应该退出循环
@@ -36,6 +39,16 @@ pub const StepOutcome = struct {
     exit_data: ?std_json.Value = null,
     /// 下一轮的提示词（注入到 tool_results 之后）
     next_prompt: ?[]const u8 = null,
+
+    pub fn deinit(self: *StepOutcome, allocator: Allocator) void {
+        if (self.result_owned) {
+            allocator.free(self.result);
+        }
+        if (self.next_prompt) |prompt| {
+            allocator.free(prompt);
+        }
+        self.* = .{ .result = "" };
+    }
 };
 
 // ============================================================================
@@ -71,7 +84,7 @@ pub const NoToolOutcome = struct {
 pub const Handler = struct {
     allocator: Allocator,
     /// 工具注册表
-    registry: tools.Registry,
+    registry: tools.ToolRegistry,
     /// 工作记忆（键值对形式）
     working: std.StringHashMap([]const u8),
     /// 历史摘要列表
@@ -99,7 +112,7 @@ pub const Handler = struct {
     pub fn init(allocator: Allocator, config: HandlerConfig) Handler {
         return .{
             .allocator = allocator,
-            .registry = tools.Registry.init(allocator),
+            .registry = tools.ToolRegistry.init(allocator),
             .working = std.StringHashMap([]const u8).init(allocator),
             .history_info = std.ArrayList([]const u8).init(allocator),
             .cwd = config.cwd orelse "/workspace",
@@ -147,14 +160,31 @@ pub const Handler = struct {
     // ================================================================
 
     /// 注册一个工具
-    pub fn registerTool(self: *Handler, tool: ToolDef) !void {
-        try self.registry.register(tool);
+    pub fn registerToolEntry(self: *Handler, entry: tools.ToolEntry) !void {
+        try self.registry.register(entry);
     }
 
-    /// 批量注册工具
+    /// 注册一个工具（兼容旧版 ToolDef）
+    pub fn registerTool(self: *Handler, tool: ToolDef) !void {
+        try self.registry.register(.{
+            .name = tool.name,
+            .description = tool.description,
+            .parameters_schema = tool.parameters_schema,
+            .func = tool.execute,
+        });
+    }
+
+    /// 批量注册工具（兼容旧版 ToolDef）
     pub fn registerTools(self: *Handler, tool_list: []const ToolDef) !void {
         for (tool_list) |tool| {
-            try self.registry.register(tool);
+            try self.registerTool(tool);
+        }
+    }
+
+    /// 批量注册 modern ToolEntry
+    pub fn registerToolEntries(self: *Handler, entries: []const tools.ToolEntry) !void {
+        for (entries) |entry| {
+            try self.registry.register(entry);
         }
     }
 
@@ -177,7 +207,6 @@ pub const Handler = struct {
         args: std_json.Value,
         response: []const u8,
     ) StepOutcome {
-        _ = response;
         self.current_turn += 1;
 
         // -----------------------------------------------------------
@@ -196,8 +225,8 @@ pub const Handler = struct {
             // Clone exit_data via JSON round-trip
             var exit_data_val: ?std_json.Value = null;
             if (args == .object) {
-                const data_str = std.json.stringifyAlloc(self.allocator, args, .{}) catch "";
-                const parsed = std.json.parseFromSlice(std_json.Value, self.allocator, data_str, .{}) catch null;
+                const data_str = std_json.stringifyAlloc(self.allocator, args, .{}) catch "";
+                const parsed = std_json.parseFromSlice(std_json.Value, self.allocator, data_str, .{}) catch null;
                 if (parsed) |*p| {
                     exit_data_val = p.value;
                     self.allocator.free(data_str);
@@ -226,46 +255,68 @@ pub const Handler = struct {
         // -----------------------------------------------------------
         // 查找并执行注册的工具
         // -----------------------------------------------------------
-        const tool_def = self.registry.find(tool_name) orelse {
-            const err_msg = std.fmt.allocPrint(
-                self.allocator,
-                "工具 '{s}' 未注册。可用工具请参考系统提示词。",
-                .{tool_name},
-            ) catch "未知工具";
+        const args_str = std_json.stringifyAlloc(self.allocator, args, .{}) catch "{}";
+        const args_doc = json.parseFromString(self.allocator, args_str) catch null;
+        defer if (args_doc) |d| d.deinit(self.allocator);
+        const local_args = if (args_doc) |d| blk: {
+            d.acquire();
+            defer d.release();
+            break :blk d.root.v();
+        } else json.Value.null;
+        self.allocator.free(args_str);
 
-            return .{
-                .result = err_msg,
-                .is_error = true,
-            };
+        var ctx = tools.ToolContext{
+            .allocator = self.allocator,
+            .cwd = self.cwd,
+            .current_turn = self.current_turn,
+            .parent = null,
         };
 
-        // 将参数序列化为 JSON 字符串传给工具执行函数
-        const args_str = std.json.stringifyAlloc(self.allocator, args, .{}) catch "{}";
-        defer self.allocator.free(args_str);
+        var tool_result = self.registry.dispatch(&ctx, tool_name, local_args, response);
+        var next_prompt: ?[]const u8 = null;
+        if (tool_result.next_prompt) |prompt| {
+            next_prompt = prompt;
+            tool_result.next_prompt = null;
+        }
 
-        // 执行工具
-        const result = tool_def.execute(args_str, self.allocator) catch |err| {
-            const err_msg = std.fmt.allocPrint(
-                self.allocator,
-                "工具 '{s}' 执行失败: {}",
-                .{ tool_name, err },
-            ) catch "工具执行失败";
+        var result_text: []const u8 = "";
+        var result_owned = false;
+        if (tool_result.data) |data| {
+            switch (data) {
+                .text => {
+                    result_text = data.text;
+                },
+                .value => |val| {
+                    if (std.meta.activeTag(val) == .string) {
+                        result_text = val.string.to();
+                    } else {
+                        const converted = json.stringifyAlloc(self.allocator, val, .{}) catch "";
+                        if (converted.len > 0) {
+                            result_text = converted;
+                            result_owned = true;
+                        }
+                    }
+                },
+            }
+        }
 
-            return .{
-                .result = err_msg,
-                .is_error = true,
-            };
-        };
+        const should_exit = tool_result.should_exit;
+        tool_result.deinit(self.allocator);
 
         if (self.verbose) {
             std.log.info("[handler] tool '{s}' executed, result len: {d}", .{
                 tool_name,
-                result.len,
+                result_text.len,
             });
         }
 
         return .{
-            .result = result,
+            .result = result_text,
+            .result_owned = result_owned,
+            .is_error = false,
+            .should_exit = should_exit,
+            .exit_data = null,
+            .next_prompt = next_prompt,
         };
     }
 
@@ -481,13 +532,12 @@ pub const Handler = struct {
         defer defs.deinit();
 
         // 遍历注册表中的所有工具
-        var it = self.registry.tools.iterator();
-        while (it.next()) |entry| {
-            const tool = entry.value_ptr.*;
+        for (self.registry.getToolNames()) |name| {
+            const entry = self.registry.find(name) orelse continue;
             defs.append(.{
-                .name = tool.name,
-                .description = tool.description,
-                .parameters = tool.parameters_schema,
+                .name = entry.name,
+                .description = entry.description,
+                .parameters = entry.parameters_schema,
             }) catch continue;
         }
 
@@ -827,7 +877,7 @@ test "Handler dispatch - exit tool" {
 
     // Create a std.json.dynamic.Value object using parseFromSlice
     const json_str = "{\"message\":\"done\"}";
-    const parsed = try std.json.parseFromSlice(std_json.Value, testing.allocator, json_str, .{});
+    const parsed = try json.parseFromSlice(json.Value, testing.allocator, json_str, .{});
     defer parsed.deinit();
 
     const outcome = handler.dispatch("exit", parsed.value, "");

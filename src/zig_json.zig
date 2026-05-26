@@ -35,6 +35,10 @@ pub fn parseFromSlice(alloc: std.mem.Allocator, path: string, input: string, opt
     return parse(alloc, path, &fbs, options);
 }
 
+pub fn parseFromString(alloc: std.mem.Allocator, input: string) !Document {
+    return parseFromSlice(alloc, "", input, .{ .support_trailing_commas = true, .maximum_depth = 100 });
+}
+
 fn parseElementPrecise(alloc: std.mem.Allocator, p: *Parser, comptime E: type) E!ValueIndex {
     return @errorCast(parseElement(alloc, p));
 }

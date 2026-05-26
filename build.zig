@@ -1,25 +1,58 @@
 const std = @import("std");
 
-// 虽然在 build.zig 中不能直接 import 用户代码来检查模块，
-// 但我们声明模块路径供 .addModule 使用。
-// 实际模块解析在 exe step 中通过 .addModule 完成。
-
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
     // ---------------------------------------------------------------
-    // 模块定义
+    // 外部依赖模块（手动设置 zigmod 依赖）
     // ---------------------------------------------------------------
 
-    // json 模块 —— 自定义 JSON 解析/序列化
-    const json_module = b.addModule("json", .{
-        .root_source_file = b.path("src/zig_json.zig"),
+    // extras 模块
+    const extras_module = b.addModule("extras", .{
+        .root_source_file = b.path(".zigmod/deps/git/github.com/nektro/zig-extras/src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    // llm 模块 —— 大语言模型接口（HTTP 调用、提示词构建等）
+    // nio 模块
+    const nio_module = b.addModule("nio", .{
+        .root_source_file = b.path(".zigmod/deps/git/github.com/nektro/zig-nio/nio.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "extras", .module = extras_module },
+        },
+    });
+
+    // intrusive-parser 模块
+    const intrusive_parser_module = b.addModule("intrusive-parser", .{
+        .root_source_file = b.path(".zigmod/deps/git/github.com/nektro/zig-intrusive-parser/intrusive_parser.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "extras", .module = extras_module },
+            .{ .name = "nio", .module = nio_module },
+        },
+    });
+
+    // ---------------------------------------------------------------
+    // 内部模块定义
+    // ---------------------------------------------------------------
+
+    // json 模块 —— 使用本地 zig_json.zig
+    const json_module = b.addModule("json", .{
+        .root_source_file = b.path("src/zig_json.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "extras", .module = extras_module },
+            .{ .name = "nio", .module = nio_module },
+            .{ .name = "intrusive-parser", .module = intrusive_parser_module },
+        },
+    });
+
+    // llm 模块 —— 大语言模型接口
     const llm_module = b.addModule("llm", .{
         .root_source_file = b.path("src/llm/root.zig"),
         .target = target,
@@ -43,7 +76,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // agent 模块 —— Agent 核心循环，依赖 llm / tools / memory / json
+    // agent 模块 —— Agent 核心循环
     const agent_module = b.addModule("agent", .{
         .root_source_file = b.path("src/agent/root.zig"),
         .target = target,
@@ -82,6 +115,9 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("agent", agent_module);
     exe.root_module.addImport("config", config_module);
 
+    // 链接 libc（某些依赖需要）
+    exe.linkLibC();
+
     b.installArtifact(exe);
 
     // ---------------------------------------------------------------
@@ -101,7 +137,6 @@ pub fn build(b: *std.Build) void {
     // 测试 step
     // ---------------------------------------------------------------
 
-    // 主程序测试
     const exe_tests = b.addTest(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -112,6 +147,7 @@ pub fn build(b: *std.Build) void {
     exe_tests.root_module.addImport("tools", tools_module);
     exe_tests.root_module.addImport("memory", memory_module);
     exe_tests.root_module.addImport("agent", agent_module);
+    exe_tests.linkLibC();
 
     const run_exe_tests = b.addRunArtifact(exe_tests);
 

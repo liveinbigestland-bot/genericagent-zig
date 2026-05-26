@@ -485,7 +485,7 @@ pub fn agentRunnerLoopWithCallbacks(
                 }
 
                 // 调用 handler 分发工具
-                const outcome = handler.dispatch(
+                var outcome = handler.dispatch(
                     tc.name,
                     tc.arguments,
                     llm_response.content orelse "",
@@ -538,6 +538,9 @@ pub fn agentRunnerLoopWithCallbacks(
                         handler.setNextPrompt(prompt);
                     }
                 }
+
+                // 清理 outcome 资源
+                outcome.deinit(allocator);
             }
 
             // -------------------------------------------------------
