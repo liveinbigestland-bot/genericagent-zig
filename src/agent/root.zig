@@ -123,7 +123,18 @@ pub const Agent = struct {
     /// 初始化 Agent
     pub fn init(allocator: Allocator, config: AgentInitConfig) !Agent {
         const system_prompt = config.system_prompt orelse
-            "你是一个通用的 AI 助手，可以帮助用户完成各种任务。";
+            "你是一个通用的 AI 助手，可以帮助用户完成各种任务。\n\n" ++
+                "你可以使用以下工具来帮助完成任务：\n\n" ++
+                "1. working_memory_set - 设置工作记忆中的键值对\n" ++
+                "   - 当需要记住某些信息时使用\n" ++
+                "   - 参数：{\"key\": \"键名\", \"value\": \"值\"}\n\n" ++
+                "2. working_memory_get - 获取工作记忆中的值\n" ++
+                "   - 当需要查询已记住的信息时使用\n" ++
+                "   - 参数：{\"key\": \"键名\"}\n\n" ++
+                "3. exit - 退出 Agent\n" ++
+                "   - 当任务完成时使用\n" ++
+                "   - 参数：{\"message\": \"退出消息\"}（可选）\n\n" ++
+                "请根据用户的需求，合理使用工具来完成任务。如果用户询问记忆相关的内容，请使用 working_memory_get 工具查询。";
 
         const handler = Handler.init(allocator, .{
             .cwd = config.cwd,
@@ -369,18 +380,16 @@ pub const Agent = struct {
             .on_event = onEventFn,
         };
 
-        // 将回调包装为 anyopaque 版本
-        // 由于 Zig 的 comptime 限制，我们直接在这里调用带回调的版本
-        _ = callbacks;
-
-        // 使用无回调版本（回调需要 comptime Context，这里简化处理）
-        const result = loop.agentRunnerLoop(
+        // 调用带回调的版本
+        const result = loop.agentRunnerLoopWithCallbacks(
             self.allocator,
             session,
             &self.handler,
             self.system_prompt,
             user_input,
             self.config,
+            Context,
+            &callbacks,
         ) catch |err| {
             std.log.err("[agent] loop failed: {}", .{err});
             return AgentError.LlmError;

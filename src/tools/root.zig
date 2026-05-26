@@ -149,8 +149,5 @@ pub fn getToolsSchemaJson(allocator: std.mem.Allocator) ![]const u8 {
     var reg = try createDefaultRegistry(allocator);
     defer reg.deinit();
 
-    const schema = try reg.buildToolsSchema();
-    defer schema.deinit(allocator);
-
-    return json.toString(allocator, &schema);
+    return reg.buildToolsSchema();
 }

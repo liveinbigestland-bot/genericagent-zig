@@ -167,63 +167,38 @@ pub const ToolRegistry = struct {
     }
 
     /// 生成所有工具定义的 JSON Schema 数组（用于发送给 LLM）
-    /// 返回的 json.Value 由 allocator 管理，调用方负责 deinit
-    pub fn buildToolsSchema(self: *ToolRegistry) !json.Value {
-        var arr = json.Value.Array.init(self.allocator);
-        errdefer {
-            for (arr.items) |*item| item.deinit(self.allocator);
-            arr.deinit(self.allocator);
-        }
+    /// 返回的字符串由 allocator 管理，调用方负责 free
+    pub fn buildToolsSchema(self: *ToolRegistry) ![]const u8 {
+        const std_json = std.json;
+
+        var tools = std.ArrayList(std_json.Value).init(self.allocator);
+        errdefer tools.deinit();
 
         for (self.ordered_names.items) |name| {
             const entry = self.entries.get(name).?;
 
-            var obj = json.Value.Object.init(self.allocator);
-            errdefer {
-                var it = obj.iterator();
-                while (it.next()) |e| {
-                    e.value_ptr.deinit(self.allocator);
-                    self.allocator.free(e.key_ptr.*);
-                }
-                obj.deinit(self.allocator);
-            }
+            var func_obj = std_json.ObjectMap.init(self.allocator);
+            errdefer func_obj.deinit();
 
-            // "type": "function"
-            const type_key = try self.allocator.dupe(u8, "type");
-            try obj.put(type_key, .{ .string = "function" });
+            try func_obj.put("name", .{ .string = entry.name });
+            try func_obj.put("description", .{ .string = entry.description });
 
-            // "function": { "name": ..., "description": ..., "parameters": ... }
-            var func_obj = json.Value.Object.init(self.allocator);
-            errdefer {
-                var it2 = func_obj.iterator();
-                while (it2.next()) |e| {
-                    e.value_ptr.deinit(self.allocator);
-                    self.allocator.free(e.key_ptr.*);
-                }
-                func_obj.deinit(self.allocator);
-            }
+            // parameters: 从 JSON Schema 字符串解析
+            const params_val = std_json.parseFromSlice(std_json.Value, self.allocator, entry.parameters_schema, .{}) catch
+                std_json.Value.null;
+            defer if (params_val != .null) params_val.deinit(self.allocator);
+            try func_obj.put("parameters", params_val);
 
-            {
-                const n_key = try self.allocator.dupe(u8, "name");
-                try func_obj.put(n_key, .{ .string = entry.name });
+            var obj = std_json.ObjectMap.init(self.allocator);
+            errdefer obj.deinit();
 
-                const d_key = try self.allocator.dupe(u8, "description");
-                try func_obj.put(d_key, .{ .string = entry.description });
+            try obj.put("type", .{ .string = "function" });
+            try obj.put("function", .{ .object = func_obj });
 
-                // parameters: 从 JSON Schema 字符串解析
-                const p_key = try self.allocator.dupe(u8, "parameters");
-                const params_val = json.parseFromString(self.allocator, entry.parameters_schema) catch
-                    json.Value.null;
-                try func_obj.put(p_key, params_val);
-            }
-
-            const func_key = try self.allocator.dupe(u8, "function");
-            try obj.put(func_key, .{ .object = func_obj });
-
-            try arr.append(.{ .object = obj });
+            try tools.append(.{ .object = obj });
         }
 
-        return .{ .array = arr };
+        return std_json.stringifyAlloc(self.allocator, tools.items, .{});
     }
 };
 

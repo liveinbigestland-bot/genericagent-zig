@@ -20,7 +20,7 @@ pub fn main() !void {
     const str = cfg.Strings.get(lang);
 
     const stdout_file = std.io.getStdOut();
-    const stdout = stdout_file.writer();
+    var stdout = stdout_file.writer();
     const stdin = std.io.getStdIn().reader();
 
     try stdout.print(
@@ -82,7 +82,7 @@ pub fn main() !void {
             continue;
         }
 
-        var result = ag.runSingle(trimmed) catch |err| {
+        var result = ag.runSingleWithCallbacks(trimmed, void, @as(*void, @ptrCast(&stdout)), onEvent) catch |err| {
             try stdout.print("{s}{}\n", .{ str.agent_error, err });
             continue;
         };
@@ -105,5 +105,19 @@ fn setupConsole() !void {
         };
         _ = kernel32.SetConsoleOutputCP(65001);
         _ = kernel32.SetConsoleCP(65001);
+    }
+}
+
+fn onEvent(ctx: *void, event: agent.LoopEvent) void {
+    _ = ctx;
+    const stdout = std.io.getStdOut().writer();
+    switch (event) {
+        .thinking => |thinking| {
+            stdout.print("[思考] {s}\n", .{thinking.text}) catch {};
+        },
+        .text => |text| {
+            stdout.print("[文本] {s}\n", .{text.text}) catch {};
+        },
+        else => {},
     }
 }

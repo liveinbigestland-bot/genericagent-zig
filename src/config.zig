@@ -14,7 +14,7 @@ pub const Config = struct {
         const parsed = try std.json.parseFromSlice(Config, allocator, content, .{
             .ignore_unknown_fields = true,
         });
-        errdefer parsed.deinit();
+        defer parsed.deinit();
 
         return .{
             .api_key = try allocator.dupe(u8, parsed.value.api_key),

@@ -209,7 +209,7 @@ pub fn agentRunnerLoop(
     config: AgentConfig,
 ) !LoopResult {
     // 无回调版本：使用 noop 回调
-    return agentRunnerLoopWithCallbacks(allocator, session, handler, system_prompt, user_input, config, null);
+    return agentRunnerLoopWithCallbacks(allocator, session, handler, system_prompt, user_input, config, void, null);
 }
 
 /// 带回调的 Agent 执行循环引擎
@@ -220,7 +220,8 @@ pub fn agentRunnerLoopWithCallbacks(
     system_prompt: []const u8,
     user_input: []const u8,
     config: AgentConfig,
-    comptime callbacks: ?LoopCallbacks(anyopaque),
+    comptime Context: type,
+    callbacks: ?*const LoopCallbacks(Context),
 ) !LoopResult {
     // ---------------------------------------------------------------
     // 1. 初始化消息列表
@@ -343,7 +344,6 @@ pub fn agentRunnerLoopWithCallbacks(
         }
 
         if (llm_response.thinking) |t| {
-            std.debug.print("DEBUG loop: llm_response.thinking ptr={*}, len={d}\n", .{ t.ptr, t.len });
             if (t.len > 0) {
                 try content_blocks.append(.{
                     .tag = .thinking,
@@ -389,14 +389,16 @@ pub fn agentRunnerLoopWithCallbacks(
             });
         }
 
-        const blocks_owned = try allocator.alloc(llm_types.ContentBlock, content_blocks.items.len);
-        @memcpy(blocks_owned, content_blocks.items);
-        content_blocks.items.len = 0;
+        if (content_blocks.items.len > 0) {
+            const blocks_owned = try allocator.alloc(llm_types.ContentBlock, content_blocks.items.len);
+            @memcpy(blocks_owned, content_blocks.items);
+            content_blocks.items.len = 0;
 
-        try messages.append(.{
-            .role = .assistant,
-            .content_blocks = blocks_owned,
-        });
+            try messages.append(.{
+                .role = .assistant,
+                .content_blocks = blocks_owned,
+            });
+        }
 
         // -----------------------------------------------------------
         // c. 处理 tool_calls 或 no_tool 情况
@@ -631,6 +633,9 @@ pub fn agentRunnerLoopWithCallbacks(
             },
         });
     }
+
+    // 释放工具定义
+    allocator.free(tool_defs);
 
     return LoopResult{
         .reason = reason,

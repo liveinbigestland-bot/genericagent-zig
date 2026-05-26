@@ -129,9 +129,10 @@ pub const Handler = struct {
 
     /// 释放资源
     pub fn deinit(self: *Handler) void {
-        // 释放工作记忆中的值
+        // 释放工作记忆中的键值对
         var it = self.working.iterator();
         while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
             self.allocator.free(entry.value_ptr.*);
         }
         self.working.deinit();
@@ -591,6 +592,7 @@ pub const Handler = struct {
         const owned_key = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned_key);
         const owned_value = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(owned_value);
 
         // 如果键已存在，释放旧值
         if (self.working.fetchRemove(key)) |kv| {
@@ -700,11 +702,7 @@ pub const Handler = struct {
         };
 
         return .{
-            .result = std.fmt.allocPrint(
-                self.allocator,
-                "已设置工作记忆: {s} = {s}",
-                .{ key, value },
-            ) catch "已设置工作记忆",
+            .result = "已设置工作记忆",
         };
     }
 
@@ -726,21 +724,13 @@ pub const Handler = struct {
 
         const value = self.getWorkingMemory(key) orelse {
             return .{
-                .result = std.fmt.allocPrint(
-                    self.allocator,
-                    "工作记忆中不存在键: {s}",
-                    .{key},
-                ) catch "键不存在",
+                .result = "工作记忆中不存在该键",
                 .is_error = true,
             };
         };
 
         return .{
-            .result = std.fmt.allocPrint(
-                self.allocator,
-                "{s} = {s}",
-                .{ key, value },
-            ) catch value,
+            .result = value,
         };
     }
 

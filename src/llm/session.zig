@@ -207,7 +207,6 @@ pub const ClaudeSession = struct {
         tools: ?[]const ToolDefinition,
         stream: bool,
     ) ![]const u8 {
-        _ = tools;
         var array = std.ArrayList(u8).init(self.allocator);
         defer array.deinit();
 
@@ -219,6 +218,30 @@ pub const ClaudeSession = struct {
         try array.appendSlice(if (stream) "true" else "false");
         try array.appendSlice(",\"temperature\":");
         try array.writer().print("{d}", .{self.config.temperature});
+
+        // 添加工具定义（Anthropic Claude 格式）
+        if (tools) |tool_list| {
+            try array.appendSlice(",\"tools\":[");
+            for (tool_list, 0..) |tool, i| {
+                if (i > 0) try array.appendSlice(",");
+                try array.appendSlice("{\"name\":\"");
+                try array.appendSlice(tool.name);
+                try array.appendSlice("\",\"description\":\"");
+                for (tool.description) |ch| {
+                    if (ch == '"') {
+                        try array.appendSlice("\\\"");
+                    } else if (ch == '\\') {
+                        try array.appendSlice("\\\\");
+                    } else {
+                        try array.append(ch);
+                    }
+                }
+                try array.appendSlice("\",\"input_schema\":");
+                try array.appendSlice(tool.parameters);
+                try array.appendSlice("}");
+            }
+            try array.appendSlice("]");
+        }
 
         var system_content: ?[]const u8 = null;
         var user_messages = std.ArrayList(Message).init(self.allocator);
@@ -257,8 +280,10 @@ pub const ClaudeSession = struct {
             if (i > 0) try array.appendSlice(",");
             try array.appendSlice("{\"role\":\"");
             try array.appendSlice(msg.role.toString());
-            try array.appendSlice("\",\"content\":\"");
+            try array.appendSlice("\",\"content\":[");
+
             if (msg.content) |c| {
+                try array.appendSlice("{\"type\":\"text\",\"thinking\":\"\",\"text\":\"");
                 for (c) |ch| {
                     if (ch == '"') {
                         try array.appendSlice("\\\"");
@@ -274,8 +299,152 @@ pub const ClaudeSession = struct {
                         try array.append(ch);
                     }
                 }
+                try array.appendSlice("\"}");
+            } else if (msg.content_blocks) |blocks| {
+                for (blocks, 0..) |block, j| {
+                    if (j > 0) try array.appendSlice(",");
+                    switch (block.tag) {
+                        .text => {
+                            try array.appendSlice("{\"type\":\"text\",\"thinking\":\"\",\"text\":\"");
+                            if (block.text) |text| {
+                                for (text) |ch| {
+                                    if (ch == '"') {
+                                        try array.appendSlice("\\\"");
+                                    } else if (ch == '\\') {
+                                        try array.appendSlice("\\\\");
+                                    } else if (ch == '\n') {
+                                        try array.appendSlice("\\n");
+                                    } else if (ch == '\r') {
+                                        try array.appendSlice("\\r");
+                                    } else if (ch == '\t') {
+                                        try array.appendSlice("\\t");
+                                    } else {
+                                        try array.append(ch);
+                                    }
+                                }
+                            }
+                            try array.appendSlice("\"}");
+                        },
+                        .thinking => {
+                            try array.appendSlice("{\"type\":\"thinking\",\"thinking\":\"\",\"text\":\"");
+                            if (block.text) |text| {
+                                for (text) |ch| {
+                                    if (ch == '"') {
+                                        try array.appendSlice("\\\"");
+                                    } else if (ch == '\\') {
+                                        try array.appendSlice("\\\\");
+                                    } else if (ch == '\n') {
+                                        try array.appendSlice("\\n");
+                                    } else if (ch == '\r') {
+                                        try array.appendSlice("\\r");
+                                    } else if (ch == '\t') {
+                                        try array.appendSlice("\\t");
+                                    } else {
+                                        try array.append(ch);
+                                    }
+                                }
+                            }
+                            try array.appendSlice("\"}");
+                        },
+                        .tool_use => {
+                            try array.appendSlice("{\"type\":\"tool_use\",\"thinking\":\"\",\"id\":\"");
+                            if (block.id) |id| {
+                                for (id) |ch| {
+                                    if (ch == '"') {
+                                        try array.appendSlice("\\\"");
+                                    } else if (ch == '\\') {
+                                        try array.appendSlice("\\\\");
+                                    } else {
+                                        try array.append(ch);
+                                    }
+                                }
+                            }
+                            try array.appendSlice("\",\"name\":\"");
+                            if (block.name) |name| {
+                                for (name) |ch| {
+                                    if (ch == '"') {
+                                        try array.appendSlice("\\\"");
+                                    } else if (ch == '\\') {
+                                        try array.appendSlice("\\\\");
+                                    } else {
+                                        try array.append(ch);
+                                    }
+                                }
+                            }
+                            try array.appendSlice("\",\"input\":");
+                            if (block.input) |input| {
+                                const args_json = std.json.stringifyAlloc(self.allocator, input, .{}) catch "{}";
+                                defer self.allocator.free(args_json);
+                                try array.appendSlice(args_json);
+                            } else {
+                                try array.appendSlice("{}");
+                            }
+                            try array.appendSlice("}");
+                        },
+                        .image => {
+                            try array.appendSlice("{\"type\":\"image\",\"thinking\":\"\",\"source\":{\"type\":\"base64\",\"media_type\":\"");
+                            if (block.media_type) |media_type| {
+                                for (media_type) |ch| {
+                                    if (ch == '"') {
+                                        try array.appendSlice("\\\"");
+                                    } else if (ch == '\\') {
+                                        try array.appendSlice("\\\\");
+                                    } else {
+                                        try array.append(ch);
+                                    }
+                                }
+                            }
+                            try array.appendSlice("\",\"data\":\"");
+                            if (block.data) |data| {
+                                for (data) |ch| {
+                                    if (ch == '"') {
+                                        try array.appendSlice("\\\"");
+                                    } else if (ch == '\\') {
+                                        try array.appendSlice("\\\\");
+                                    } else {
+                                        try array.append(ch);
+                                    }
+                                }
+                            }
+                            try array.appendSlice("\"}}");
+                        },
+                        .tool_result => {
+                            try array.appendSlice("{\"type\":\"tool_result\",\"thinking\":\"\",\"tool_use_id\":\"");
+                            if (block.tool_use_id) |tool_use_id| {
+                                for (tool_use_id) |ch| {
+                                    if (ch == '"') {
+                                        try array.appendSlice("\\\"");
+                                    } else if (ch == '\\') {
+                                        try array.appendSlice("\\\\");
+                                    } else {
+                                        try array.append(ch);
+                                    }
+                                }
+                            }
+                            try array.appendSlice("\",\"content\":\"");
+                            if (block.content) |content| {
+                                for (content) |ch| {
+                                    if (ch == '"') {
+                                        try array.appendSlice("\\\"");
+                                    } else if (ch == '\\') {
+                                        try array.appendSlice("\\\\");
+                                    } else if (ch == '\n') {
+                                        try array.appendSlice("\\n");
+                                    } else if (ch == '\r') {
+                                        try array.appendSlice("\\r");
+                                    } else if (ch == '\t') {
+                                        try array.appendSlice("\\t");
+                                    } else {
+                                        try array.append(ch);
+                                    }
+                                }
+                            }
+                            try array.appendSlice("\"}");
+                        },
+                    }
+                }
             }
-            try array.appendSlice("\"}");
+            try array.appendSlice("]}");
         }
         try array.appendSlice("]}");
 
@@ -288,53 +457,22 @@ pub const ClaudeSession = struct {
         defer self.allocator.free(url);
 
         const headers = try self.buildHeaders();
+        defer if (headers.authorization) |auth| self.allocator.free(auth);
         const body = try self.buildRequestBody(messages, tools, false);
         defer self.allocator.free(body);
 
-        std.log.info("=== Claude Request ===", .{});
-        std.log.info("URL: {s}", .{url});
-        std.log.info("Headers - Content-Type: {s}, Accept: {s}", .{ headers.content_type, headers.accept });
-        if (headers.authorization) |auth| {
-            std.log.info("Headers - Authorization: Bearer {s}...", .{auth[7..@min(20, auth.len)]});
-        }
-        std.log.info("Body: {s}", .{body});
-        std.log.info("=====================", .{});
-
-        std.debug.print("DEBUG: About to call client.post()\n", .{});
         const result = self.client.post(url, headers, body) catch |err| {
             std.log.err("Claude request failed: {}", .{err});
             return err;
         };
-        std.debug.print("DEBUG: client.post() returned\n", .{});
         defer self.allocator.free(result.body);
 
-        std.debug.print("RESPONSE len={d}\n", .{result.body.len});
-        if (result.body.len > 0) {
-            std.debug.print("RESPONSE first 8 bytes hex: ", .{});
-            for (result.body[0..@min(8, result.body.len)], 0..) |b, i| {
-                std.debug.print("{x:0>2} ", .{b});
-                if (i == 7) break;
-            }
-            std.debug.print("\n", .{});
-        }
-
         if (result.body.len == 0) {
-            std.debug.print("ERROR: Empty response body!\n", .{});
+            std.log.err("Empty response body", .{});
             return LlmError.InvalidResponse;
         }
 
-        std.debug.print("DEBUG: About to call parseResponse, body ptr={*}, len={d}\n", .{ result.body.ptr, result.body.len });
-
-        const llm_response = self.parseResponse(result.body) catch |err| {
-            std.debug.print("DEBUG: parseResponse failed: {}\n", .{err});
-            return err;
-        };
-        std.debug.print("DEBUG: parseResponse returned, has_thinking={}, has_content={}\n", .{
-            llm_response.thinking != null,
-            llm_response.content != null,
-        });
-
-        return llm_response;
+        return self.parseResponse(result.body);
     }
 
     /// 发送请求（流式）
@@ -349,17 +487,9 @@ pub const ClaudeSession = struct {
         defer self.allocator.free(url);
 
         const headers = try self.buildHeaders();
+        defer if (headers.authorization) |auth| self.allocator.free(auth);
         const body = try self.buildRequestBody(messages, tools, true);
         defer self.allocator.free(body);
-
-        std.log.info("=== Claude Request ===", .{});
-        std.log.info("URL: {s}", .{url});
-        std.log.info("Headers - Content-Type: {s}, Accept: {s}", .{ headers.content_type, headers.accept });
-        if (headers.authorization) |auth| {
-            std.log.info("Headers - Authorization: Bearer {s}...", .{auth[7..@min(20, auth.len)]});
-        }
-        std.log.info("Body: {s}", .{body});
-        std.log.info("=====================", .{});
 
         return self.client.postStream(url, headers, body, ctx, onEvent);
     }
@@ -395,12 +525,21 @@ pub const ClaudeSession = struct {
                         if (block_type != .string) continue;
 
                         if (std.mem.eql(u8, block_type.string, "thinking")) {
+                            // 首先从 thinking 字段读取（原始 Claude API）
                             if (item.object.get("thinking")) |thinking_val| {
-                                if (thinking_val == .string) {
+                                if (thinking_val == .string and thinking_val.string.len > 0) {
                                     if (thinking_buf.items.len > 0) {
                                         thinking_buf.append('\n') catch {};
                                     }
                                     thinking_buf.appendSlice(thinking_val.string) catch {};
+                                }
+                            }
+                            // 如果 thinking 字段为空，尝试从 text 字段读取（DeepSeek Claude API 可能使用这种格式）
+                            if (thinking_buf.items.len == 0) {
+                                if (item.object.get("text")) |thinking_val| {
+                                    if (thinking_val == .string) {
+                                        thinking_buf.appendSlice(thinking_val.string) catch {};
+                                    }
                                 }
                             }
                         } else if (std.mem.eql(u8, block_type.string, "text")) {
@@ -432,8 +571,10 @@ pub const ClaudeSession = struct {
                             const input_copy = if (input_val != null) blk: {
                                 const serialized = std.json.stringifyAlloc(self.allocator, input_val.?, .{}) catch
                                     break :blk json.Value.null;
+                                defer self.allocator.free(serialized);
                                 const cloned = std.json.parseFromSlice(json.Value, self.allocator, serialized, .{}) catch
                                     break :blk json.Value.null;
+                                defer cloned.deinit();
                                 break :blk cloned.value;
                             } else json.Value.null;
                             // Note: json.dynamic.Value does not have deinit; memory managed by arena allocator
@@ -558,6 +699,7 @@ fn claudeSessionTrimHistory(ptr: *anyopaque, max_messages: u32) void {
 fn claudeSessionDeinit(ptr: *anyopaque) void {
     const self: *ClaudeSession = @ptrCast(@alignCast(ptr));
     self.deinit();
+    self.allocator.destroy(self);
 }
 
 // ---------------------------------------------------------------------------
@@ -668,6 +810,7 @@ pub const OaiSession = struct {
         defer self.allocator.free(url);
 
         const headers = try self.buildHeaders();
+        defer if (headers.authorization) |auth| self.allocator.free(auth);
 
         const body = switch (self.config.api_mode) {
             .chat_completions => try self.buildChatCompletionsBody(messages, tools),
@@ -696,6 +839,7 @@ pub const OaiSession = struct {
         defer self.allocator.free(url);
 
         const headers = try self.buildHeaders();
+        defer if (headers.authorization) |auth| self.allocator.free(auth);
 
         const body = switch (self.config.api_mode) {
             .chat_completions => try self.buildChatCompletionsBody(messages, tools),
@@ -900,6 +1044,7 @@ fn oaiSessionTrimHistory(ptr: *anyopaque, max_messages: u32) void {
 fn oaiSessionDeinit(ptr: *anyopaque) void {
     const self: *OaiSession = @ptrCast(@alignCast(ptr));
     self.deinit();
+    self.allocator.destroy(self);
 }
 
 // ---------------------------------------------------------------------------
