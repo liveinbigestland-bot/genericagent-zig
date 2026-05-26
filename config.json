@@ -1,6 +1,6 @@
 {
   "api_key": "sk-93baa4a40eb4462ab12018f5ab2fd551",
-  "api_base": "https://api.deepseek.com",
+  "api_base": "https://api.deepseek.com/anthropic",
   "model": "deepseek-v4-flash",
   "session_type": "claude",
   "language": "auto"
