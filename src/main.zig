@@ -4,6 +4,8 @@ const llm = @import("llm");
 const cfg = @import("config");
 
 pub fn main() !void {
+    try setupConsole();
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -92,5 +94,16 @@ pub fn main() !void {
             try stdout.writeAll(resp);
         }
         try stdout.writeAll("\n\n");
+    }
+}
+
+fn setupConsole() !void {
+    if (@import("builtin").os.tag == .windows) {
+        const kernel32 = struct {
+            extern "kernel32" fn SetConsoleOutputCP(wCodePage: u32) callconv(.C) bool;
+            extern "kernel32" fn SetConsoleCP(wCodePage: u32) callconv(.C) bool;
+        };
+        _ = kernel32.SetConsoleOutputCP(65001);
+        _ = kernel32.SetConsoleCP(65001);
     }
 }

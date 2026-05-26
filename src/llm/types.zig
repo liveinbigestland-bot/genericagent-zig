@@ -140,7 +140,6 @@ pub const ToolCall = struct {
     pub fn deinit(self: *ToolCall, allocator: Allocator) void {
         allocator.free(self.id);
         allocator.free(self.name);
-        self.arguments.deinit(allocator);
     }
 };
 

@@ -205,19 +205,81 @@ pub const ClaudeSession = struct {
         self: *ClaudeSession,
         messages: []const Message,
         tools: ?[]const ToolDefinition,
+        stream: bool,
     ) ![]const u8 {
-        const string = std.json.stringifyAlloc(self.allocator, .{
-            .model = self.config.model,
-            .max_tokens = self.config.max_tokens,
-            .stream = self.config.stream,
-            .temperature = self.config.temperature,
-        }, .{}) catch return LlmError.AllocationFailed;
-
-        // TODO: 完整的 JSON 构建需要更精细的控制
-        // 这里返回简化版本，实际实现需要手动构建 JSON
-        _ = messages;
         _ = tools;
-        return string;
+        var array = std.ArrayList(u8).init(self.allocator);
+        defer array.deinit();
+
+        try array.appendSlice("{\"model\":\"");
+        try array.appendSlice(self.config.model);
+        try array.appendSlice("\",\"max_tokens\":");
+        try array.writer().print("{}", .{self.config.max_tokens});
+        try array.appendSlice(",\"stream\":");
+        try array.appendSlice(if (stream) "true" else "false");
+        try array.appendSlice(",\"temperature\":");
+        try array.writer().print("{d}", .{self.config.temperature});
+
+        var system_content: ?[]const u8 = null;
+        var user_messages = std.ArrayList(Message).init(self.allocator);
+        defer user_messages.deinit();
+
+        for (messages) |msg| {
+            if (msg.role == .system) {
+                system_content = msg.content;
+            } else {
+                user_messages.append(msg) catch {};
+            }
+        }
+
+        if (system_content) |sc| {
+            try array.appendSlice(",\"system\":\"");
+            for (sc) |ch| {
+                if (ch == '"') {
+                    try array.appendSlice("\\\"");
+                } else if (ch == '\\') {
+                    try array.appendSlice("\\\\");
+                } else if (ch == '\n') {
+                    try array.appendSlice("\\n");
+                } else if (ch == '\r') {
+                    try array.appendSlice("\\r");
+                } else if (ch == '\t') {
+                    try array.appendSlice("\\t");
+                } else {
+                    try array.append(ch);
+                }
+            }
+            try array.appendSlice("\"");
+        }
+
+        try array.appendSlice(",\"messages\":[");
+        for (user_messages.items, 0..) |msg, i| {
+            if (i > 0) try array.appendSlice(",");
+            try array.appendSlice("{\"role\":\"");
+            try array.appendSlice(msg.role.toString());
+            try array.appendSlice("\",\"content\":\"");
+            if (msg.content) |c| {
+                for (c) |ch| {
+                    if (ch == '"') {
+                        try array.appendSlice("\\\"");
+                    } else if (ch == '\\') {
+                        try array.appendSlice("\\\\");
+                    } else if (ch == '\n') {
+                        try array.appendSlice("\\n");
+                    } else if (ch == '\r') {
+                        try array.appendSlice("\\r");
+                    } else if (ch == '\t') {
+                        try array.appendSlice("\\t");
+                    } else {
+                        try array.append(ch);
+                    }
+                }
+            }
+            try array.appendSlice("\"}");
+        }
+        try array.appendSlice("]}");
+
+        return array.toOwnedSlice();
     }
 
     /// 发送请求（非流式）
@@ -226,16 +288,53 @@ pub const ClaudeSession = struct {
         defer self.allocator.free(url);
 
         const headers = try self.buildHeaders();
-        const body = try self.buildRequestBody(messages, tools);
+        const body = try self.buildRequestBody(messages, tools, false);
         defer self.allocator.free(body);
 
+        std.log.info("=== Claude Request ===", .{});
+        std.log.info("URL: {s}", .{url});
+        std.log.info("Headers - Content-Type: {s}, Accept: {s}", .{ headers.content_type, headers.accept });
+        if (headers.authorization) |auth| {
+            std.log.info("Headers - Authorization: Bearer {s}...", .{auth[7..@min(20, auth.len)]});
+        }
+        std.log.info("Body: {s}", .{body});
+        std.log.info("=====================", .{});
+
+        std.debug.print("DEBUG: About to call client.post()\n", .{});
         const result = self.client.post(url, headers, body) catch |err| {
             std.log.err("Claude request failed: {}", .{err});
             return err;
         };
+        std.debug.print("DEBUG: client.post() returned\n", .{});
         defer self.allocator.free(result.body);
 
-        return self.parseResponse(result.body);
+        std.debug.print("RESPONSE len={d}\n", .{result.body.len});
+        if (result.body.len > 0) {
+            std.debug.print("RESPONSE first 8 bytes hex: ", .{});
+            for (result.body[0..@min(8, result.body.len)], 0..) |b, i| {
+                std.debug.print("{x:0>2} ", .{b});
+                if (i == 7) break;
+            }
+            std.debug.print("\n", .{});
+        }
+
+        if (result.body.len == 0) {
+            std.debug.print("ERROR: Empty response body!\n", .{});
+            return LlmError.InvalidResponse;
+        }
+
+        std.debug.print("DEBUG: About to call parseResponse, body ptr={*}, len={d}\n", .{ result.body.ptr, result.body.len });
+
+        const llm_response = self.parseResponse(result.body) catch |err| {
+            std.debug.print("DEBUG: parseResponse failed: {}\n", .{err});
+            return err;
+        };
+        std.debug.print("DEBUG: parseResponse returned, has_thinking={}, has_content={}\n", .{
+            llm_response.thinking != null,
+            llm_response.content != null,
+        });
+
+        return llm_response;
     }
 
     /// 发送请求（流式）
@@ -250,8 +349,17 @@ pub const ClaudeSession = struct {
         defer self.allocator.free(url);
 
         const headers = try self.buildHeaders();
-        const body = try self.buildRequestBody(messages, tools);
+        const body = try self.buildRequestBody(messages, tools, true);
         defer self.allocator.free(body);
+
+        std.log.info("=== Claude Request ===", .{});
+        std.log.info("URL: {s}", .{url});
+        std.log.info("Headers - Content-Type: {s}, Accept: {s}", .{ headers.content_type, headers.accept });
+        if (headers.authorization) |auth| {
+            std.log.info("Headers - Authorization: Bearer {s}...", .{auth[7..@min(20, auth.len)]});
+        }
+        std.log.info("Body: {s}", .{body});
+        std.log.info("=====================", .{});
 
         return self.client.postStream(url, headers, body, ctx, onEvent);
     }
@@ -327,8 +435,7 @@ pub const ClaudeSession = struct {
                                 const cloned = std.json.parseFromSlice(json.Value, self.allocator, serialized, .{}) catch
                                     break :blk json.Value.null;
                                 break :blk cloned.value;
-                            } else
-                                json.Value.null;
+                            } else json.Value.null;
                             // Note: json.dynamic.Value does not have deinit; memory managed by arena allocator
 
                             try tool_calls_list.append(.{

@@ -136,22 +136,22 @@ pub const LlmClient = struct {
 
             const result = self.doPost(url, headers, body) catch |err| {
                 last_error = err;
-                // 不可重试的错误直接返回
                 if (!self.isRetryable(err)) return err;
                 continue;
             };
 
-            // 429 / 5xx 可重试
             if (result.status_code == 429) {
+                self.allocator.free(result.body);
                 last_error = LlmError.RateLimited;
                 continue;
             }
             if (result.status_code >= 500) {
+                self.allocator.free(result.body);
                 last_error = LlmError.ServerError;
                 continue;
             }
-            // 401/403 不可重试
             if (result.status_code == 401 or result.status_code == 403) {
+                self.allocator.free(result.body);
                 return LlmError.AuthFailed;
             }
 
@@ -208,15 +208,15 @@ pub const LlmClient = struct {
         headers: RequestHeaders,
         body: []const u8,
     ) LlmError!ResponseResult {
-        // 解析 URL
-        const parsed = std.Uri.parse(url) catch return LlmError.ConnectionFailed;
+        const parsed = std.Uri.parse(url) catch |err| {
+            std.log.err("URL parse failed for '{s}': {}", .{ url, err });
+            return LlmError.ConnectionFailed;
+        };
 
-        // 构建 HTTP 请求
         var req_buf: [16 * 1024]u8 = undefined;
         var client = http.Client{ .allocator = self.allocator };
         defer client.deinit();
 
-        // 构建 extra_headers 列表
         var extra_headers_list = std.ArrayList(http.Header).init(self.allocator);
         defer extra_headers_list.deinit();
 
@@ -241,42 +241,77 @@ pub const LlmClient = struct {
             .server_header_buffer = &req_buf,
             .extra_headers = extra_headers_list.items,
             .redirect_behavior = .not_allowed,
-        }) catch return LlmError.ConnectionFailed;
+        }) catch |err| {
+            std.log.err("HTTP client open failed: {}", .{err});
+            return LlmError.ConnectionFailed;
+        };
         defer result.deinit();
 
         result.transfer_encoding = .{ .content_length = body.len };
+        result.send() catch |err| {
+            std.log.err("HTTP send failed: {}", .{err});
+            return LlmError.ConnectionFailed;
+        };
+        _ = result.writeAll(body) catch |err| {
+            std.log.err("HTTP write body failed: {}", .{err});
+            return LlmError.ConnectionFailed;
+        };
+        result.finish() catch |err| {
+            std.log.err("HTTP finish failed: {}", .{err});
+            return LlmError.ConnectionFailed;
+        };
 
-        // 发送请求头
-        result.send() catch return LlmError.ConnectionFailed;
-
-        // 发送请求体
-        result.finish() catch return LlmError.ConnectionFailed;
-        _ = result.writeAll(body) catch return LlmError.ConnectionFailed;
-
-        // 等待响应
-        result.wait() catch return LlmError.ConnectionFailed;
+        result.wait() catch |err| {
+            std.log.err("HTTP wait failed: {}", .{err});
+            return LlmError.ConnectionFailed;
+        };
 
         const status = @intFromEnum(result.response.status);
+        std.log.info("HTTP response status: {}", .{status});
         if (status == 401 or status == 403) return LlmError.AuthFailed;
         if (status == 429) return LlmError.RateLimited;
         if (status >= 500) return LlmError.ServerError;
-        if (status < 200 or status >= 300) return LlmError.HttpError;
+        if (status < 200 or status >= 300) {
+            var err_body = std.ArrayList(u8).init(self.allocator);
+            defer err_body.deinit();
+            var rb: [4096]u8 = undefined;
+            while (true) {
+                const n = result.read(&rb) catch break;
+                if (n == 0) break;
+                err_body.appendSlice(rb[0..n]) catch break;
+            }
+            if (err_body.items.len > 0) {
+                std.debug.print("ERROR BODY: {s}\n", .{err_body.items});
+            } else {
+                std.debug.print("ERROR BODY: (empty)\n", .{});
+            }
+            return LlmError.HttpError;
+        }
 
         // 读取响应体
+        std.debug.print("DEBUG: Starting to read response body\n", .{});
         var response_body = std.ArrayList(u8).init(self.allocator);
         defer response_body.deinit();
 
         var read_buf: [8192]u8 = undefined;
+        var total_read: usize = 0;
         while (true) {
-            const n = result.read(&read_buf) catch return LlmError.InvalidResponse;
+            std.debug.print("DEBUG: Calling result.read()...\n", .{});
+            const n = result.read(&read_buf) catch |err| {
+                std.debug.print("DEBUG: result.read() failed: {}\n", .{err});
+                return LlmError.InvalidResponse;
+            };
+            std.debug.print("DEBUG: result.read() returned n={d}\n", .{n});
             if (n == 0) break;
             response_body.appendSlice(read_buf[0..n]) catch
                 return LlmError.AllocationFailed;
+            total_read += n;
         }
+        std.debug.print("DEBUG: Finished reading {d} bytes\n", .{total_read});
 
         return .{
             .status_code = @intCast(status),
-            .body = response_body.items,
+            .body = response_body.toOwnedSlice() catch return LlmError.AllocationFailed,
             .streaming = false,
         };
     }
@@ -289,13 +324,15 @@ pub const LlmClient = struct {
         ctx: *anyopaque,
         onEventFn: *const fn (*anyopaque, SseEvent) anyerror!void,
     ) LlmError!void {
-        const parsed = std.Uri.parse(url) catch return LlmError.ConnectionFailed;
+        const parsed = std.Uri.parse(url) catch |err| {
+            std.log.err("URL parse failed for '{s}': {}", .{ url, err });
+            return LlmError.ConnectionFailed;
+        };
 
         var req_buf: [16 * 1024]u8 = undefined;
         var client = http.Client{ .allocator = self.allocator };
         defer client.deinit();
 
-        // 构建 extra_headers 列表
         var extra_headers_list = std.ArrayList(http.Header).init(self.allocator);
         defer extra_headers_list.deinit();
 
@@ -320,21 +357,52 @@ pub const LlmClient = struct {
             .server_header_buffer = &req_buf,
             .extra_headers = extra_headers_list.items,
             .redirect_behavior = .not_allowed,
-        }) catch return LlmError.ConnectionFailed;
+        }) catch |err| {
+            std.log.err("HTTP client open failed: {}", .{err});
+            return LlmError.ConnectionFailed;
+        };
         defer result.deinit();
 
         result.transfer_encoding = .{ .content_length = body.len };
-        result.send() catch return LlmError.ConnectionFailed;
-        result.finish() catch return LlmError.ConnectionFailed;
-        _ = result.writeAll(body) catch return LlmError.ConnectionFailed;
+        result.send() catch |err| {
+            std.log.err("HTTP send failed: {}", .{err});
+            return LlmError.ConnectionFailed;
+        };
+        _ = result.writeAll(body) catch |err| {
+            std.log.err("HTTP write body failed: {}", .{err});
+            return LlmError.ConnectionFailed;
+        };
+        result.finish() catch |err| {
+            std.log.err("HTTP finish failed: {}", .{err});
+            return LlmError.ConnectionFailed;
+        };
 
-        result.wait() catch return LlmError.ConnectionFailed;
+        result.wait() catch |err| {
+            std.log.err("HTTP wait failed: {}", .{err});
+            return LlmError.ConnectionFailed;
+        };
 
         const status = @intFromEnum(result.response.status);
+        std.log.info("HTTP response status: {}", .{status});
         if (status == 401 or status == 403) return LlmError.AuthFailed;
         if (status == 429) return LlmError.RateLimited;
         if (status >= 500) return LlmError.ServerError;
-        if (status < 200 or status >= 300) return LlmError.HttpError;
+        if (status < 200 or status >= 300) {
+            var err_body = std.ArrayList(u8).init(self.allocator);
+            defer err_body.deinit();
+            var rb: [4096]u8 = undefined;
+            while (true) {
+                const n = result.read(&rb) catch break;
+                if (n == 0) break;
+                err_body.appendSlice(rb[0..n]) catch break;
+            }
+            if (err_body.items.len > 0) {
+                std.debug.print("ERROR BODY: {s}\n", .{err_body.items});
+            } else {
+                std.debug.print("ERROR BODY: (empty)\n", .{});
+            }
+            return LlmError.HttpError;
+        }
 
         // 逐块读取并解析 SSE
         var sse_parser = SseParser.init(self.allocator);

@@ -290,7 +290,7 @@ pub fn agentRunnerLoopWithCallbacks(
         // -----------------------------------------------------------
         // a. 调用 LLM 获取响应
         // -----------------------------------------------------------
-        const llm_response = session.complete(messages.items, effective_tools) catch |err| {
+        var llm_response = session.complete(messages.items, effective_tools) catch |err| {
             std.log.err("[loop] LLM call failed at turn {d}: {}", .{ turn_num, err });
 
             // 通知回调：错误
@@ -309,6 +309,7 @@ pub fn agentRunnerLoopWithCallbacks(
                 .total_output_tokens = total_output_tokens,
             };
         };
+        defer llm_response.deinit(allocator);
 
         // 通知回调：thinking 内容
         if (llm_response.thinking) |thinking_text| {
@@ -342,6 +343,7 @@ pub fn agentRunnerLoopWithCallbacks(
         }
 
         if (llm_response.thinking) |t| {
+            std.debug.print("DEBUG loop: llm_response.thinking ptr={*}, len={d}\n", .{ t.ptr, t.len });
             if (t.len > 0) {
                 try content_blocks.append(.{
                     .tag = .thinking,
@@ -361,15 +363,23 @@ pub fn agentRunnerLoopWithCallbacks(
 
         for (tool_calls) |*tc| {
             // Clone arguments via JSON round-trip (std.json.dynamic.Value has no deepClone)
-            const args_str = std.json.stringifyAlloc(allocator, tc.arguments, .{}) catch "{}";
+            var args_str: []const u8 = "{}";
+            var args_str_owned = false;
+            if (std.json.stringifyAlloc(allocator, tc.arguments, .{}) catch null) |s| {
+                args_str = s;
+                args_str_owned = true;
+            }
             const parsed = std.json.parseFromSlice(
                 std.json.Value,
                 allocator,
                 args_str,
                 .{},
-            ) catch break;
+            ) catch {
+                if (args_str_owned) allocator.free(args_str);
+                break;
+            };
             defer parsed.deinit();
-            allocator.free(args_str);
+            if (args_str_owned) allocator.free(args_str);
 
             try content_blocks.append(.{
                 .tag = .tool_use,
@@ -381,6 +391,7 @@ pub fn agentRunnerLoopWithCallbacks(
 
         const blocks_owned = try allocator.alloc(llm_types.ContentBlock, content_blocks.items.len);
         @memcpy(blocks_owned, content_blocks.items);
+        content_blocks.items.len = 0;
 
         try messages.append(.{
             .role = .assistant,
@@ -455,8 +466,15 @@ pub fn agentRunnerLoopWithCallbacks(
             for (tool_calls) |*tc| {
                 // 通知回调：工具调用开始
                 if (callbacks) |cb| {
-                    const args_str = std.json.stringifyAlloc(allocator, tc.arguments, .{}) catch "{}";
-                    defer allocator.free(args_str);
+                    var args_str: []const u8 = "{}";
+                    var args_str_owned = false;
+                    if (std.json.stringifyAlloc(allocator, tc.arguments, .{}) catch null) |s| {
+                        args_str = s;
+                        args_str_owned = true;
+                    }
+                    if (args_str_owned) {
+                        defer allocator.free(args_str);
+                    }
                     cb.on_event(cb.ctx, .{
                         .tool_call_start = .{
                             .id = tc.id,
@@ -498,10 +516,18 @@ pub fn agentRunnerLoopWithCallbacks(
                     exit_reason = .exited;
                     if (outcome.exit_data) |d| {
                         // Clone via JSON round-trip
-                        const data_str = std.json.stringifyAlloc(allocator, d, .{}) catch "";
-                        const parsed = std.json.parseFromSlice(std.json.Value, allocator, data_str, .{}) catch break;
+                        var data_str: []const u8 = "{}";
+                        var data_str_owned = false;
+                        if (std.json.stringifyAlloc(allocator, d, .{}) catch null) |s| {
+                            data_str = s;
+                            data_str_owned = true;
+                        }
+                        const parsed = std.json.parseFromSlice(std.json.Value, allocator, data_str, .{}) catch {
+                            if (data_str_owned) allocator.free(data_str);
+                            break;
+                        };
                         exit_data = parsed.value;
-                        allocator.free(data_str);
+                        if (data_str_owned) allocator.free(data_str);
                     }
                 }
 
@@ -555,6 +581,7 @@ pub fn agentRunnerLoopWithCallbacks(
 
             const result_blocks_owned = try allocator.alloc(llm_types.ContentBlock, result_blocks.items.len);
             @memcpy(result_blocks_owned, result_blocks.items);
+            result_blocks.items.len = 0;
 
             try messages.append(.{
                 .role = .user,
