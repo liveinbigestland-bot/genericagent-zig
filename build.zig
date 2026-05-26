@@ -14,7 +14,7 @@ pub fn build(b: *std.Build) void {
 
     // json 模块 —— 自定义 JSON 解析/序列化
     const json_module = b.addModule("json", .{
-        .root_source_file = b.path("src/json.zig"),
+        .root_source_file = b.path("src/zig_json.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -56,6 +56,13 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // config 模块 —— 配置加载和国际化
+    const config_module = b.addModule("config", .{
+        .root_source_file = b.path("src/config.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ---------------------------------------------------------------
     // 可执行文件
     // ---------------------------------------------------------------
@@ -73,6 +80,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("tools", tools_module);
     exe.root_module.addImport("memory", memory_module);
     exe.root_module.addImport("agent", agent_module);
+    exe.root_module.addImport("config", config_module);
 
     b.installArtifact(exe);
 

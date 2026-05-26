@@ -13,7 +13,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const json_mod = @import("json.zig");
+const json_mod = @import("zig_json.zig");
 
 // ============================================================================
 // 内容块类型

@@ -131,7 +131,7 @@ pub const LlmClient = struct {
         while (attempt <= self.config.max_retries) : (attempt += 1) {
             if (attempt > 0) {
                 const delay = self.calculateBackoff(attempt);
-                std.time.sleep(delay * std.time.ns_per_ms);
+                std.time.sleep(@as(u64, delay) * std.time.ns_per_ms);
             }
 
             const result = self.doPost(url, headers, body) catch |err| {
@@ -183,7 +183,7 @@ pub const LlmClient = struct {
         while (attempt <= self.config.max_retries) : (attempt += 1) {
             if (attempt > 0) {
                 const delay = self.calculateBackoff(attempt);
-                std.time.sleep(delay * std.time.ns_per_ms);
+                std.time.sleep(@as(u64, delay) * std.time.ns_per_ms);
             }
 
             self.doPostStream(url, stream_headers, body, ctx, onEventFn) catch |err| {
