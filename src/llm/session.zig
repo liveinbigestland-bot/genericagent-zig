@@ -10,6 +10,75 @@ const json = std.json;
 const types = @import("types.zig");
 const client_mod = @import("client.zig");
 
+/// 将字符串转义并验证 UTF-8，写入 JSON 数组
+fn appendJsonString(array: *std.ArrayList(u8), input: []const u8) !void {
+    var i: usize = 0;
+    while (i < input.len) {
+        const c = input[i];
+
+        switch (c) {
+            '"' => {
+                try array.appendSlice("\\\"");
+                i += 1;
+            },
+            '\\' => {
+                try array.appendSlice("\\\\");
+                i += 1;
+            },
+            '\n' => {
+                try array.appendSlice("\\n");
+                i += 1;
+            },
+            '\r' => {
+                try array.appendSlice("\\r");
+                i += 1;
+            },
+            '\t' => {
+                try array.appendSlice("\\t");
+                i += 1;
+            },
+            '\x08' => {
+                try array.appendSlice("\\b");
+                i += 1;
+            },
+            '\x0C' => {
+                try array.appendSlice("\\f");
+                i += 1;
+            },
+            else => {
+                if (c < 0x80) {
+                    try array.append(c);
+                    i += 1;
+                } else {
+                    const len: usize = if (c < 0xE0) 2 else if (c < 0xF0) 3 else if (c < 0xF8) 4 else {
+                        i += 1;
+                        continue;
+                    };
+
+                    if (i + len > input.len) {
+                        i += 1;
+                        continue;
+                    }
+
+                    var valid = true;
+                    var j: usize = 1;
+                    while (j < len) : (j += 1) {
+                        if ((input[i + j] & 0xC0) != 0x80) {
+                            valid = false;
+                            break;
+                        }
+                    }
+
+                    if (valid) {
+                        try array.appendSlice(input[i .. i + len]);
+                    }
+                    i += len;
+                }
+            },
+        }
+    }
+}
+
 const Message = types.Message;
 const ContentBlock = types.ContentBlock;
 const ContentBlockTag = types.ContentBlockTag;
@@ -30,6 +99,81 @@ const SseEvent = client_mod.SseEvent;
 const LlmError = client_mod.LlmError;
 
 // ---------------------------------------------------------------------------
+// 交互日志工具函数
+// ---------------------------------------------------------------------------
+
+/// 日志条目结构体
+const LogEntry = struct {
+    timestamp: []const u8,
+    turn: u32,
+    request: []const u8,
+    response: []const u8,
+    status_code: u32,
+};
+
+/// 获取当前时间戳字符串（用于日志文件名）
+fn getTimestamp(allocator: Allocator) ![]const u8 {
+    const now = @divFloor(std.time.nanoTimestamp(), 1_000_000_000);
+    return std.fmt.allocPrint(allocator, "{}", .{now});
+}
+
+/// 保存交互日志到文件
+fn saveInteractionLog(allocator: Allocator, log_dir: []const u8, turn: u32, request: []const u8, response: []const u8, status_code: u32) void {
+    // 创建日志目录
+    std.fs.cwd().makePath(log_dir) catch |err| {
+        std.log.err("failed to create log directory '{s}': {}", .{ log_dir, err });
+        return;
+    };
+
+    // 生成文件名（包含轮次信息）
+    const timestamp = getTimestamp(allocator) catch |err| {
+        std.log.err("failed to get timestamp: {}", .{err});
+        return;
+    };
+    defer allocator.free(timestamp);
+
+    const file_name = std.fmt.allocPrint(allocator, "{s}/turn_{:03}_{s}.json", .{ log_dir, turn, timestamp }) catch |err| {
+        std.log.err("failed to create log file name: {}", .{err});
+        return;
+    };
+    defer allocator.free(file_name);
+
+    // 构建日志内容
+    var log_content = std.ArrayList(u8).init(allocator);
+    defer log_content.deinit();
+
+    log_content.appendSlice("{\"timestamp\":\"") catch return;
+    log_content.appendSlice(timestamp) catch return;
+    log_content.appendSlice("\",\"turn\":") catch return;
+    const turn_str = std.fmt.allocPrint(allocator, "{}", .{turn}) catch return;
+    defer allocator.free(turn_str);
+    log_content.appendSlice(turn_str) catch return;
+    log_content.appendSlice(",\"status_code\":") catch return;
+    const status_str = std.fmt.allocPrint(allocator, "{}", .{status_code}) catch return;
+    defer allocator.free(status_str);
+    log_content.appendSlice(status_str) catch return;
+    log_content.appendSlice(",\"request\":") catch return;
+    log_content.appendSlice(request) catch return;
+    log_content.appendSlice(",\"response\":") catch return;
+    log_content.appendSlice(response) catch return;
+    log_content.appendSlice("}") catch return;
+
+    // 写入文件
+    const file = std.fs.cwd().createFile(file_name, .{ .truncate = true }) catch |err| {
+        std.log.err("failed to create log file '{s}': {}", .{ file_name, err });
+        return;
+    };
+    defer file.close();
+
+    file.writeAll(log_content.items) catch |err| {
+        std.log.err("failed to write log file '{s}': {}", .{ file_name, err });
+        return;
+    };
+
+    std.log.debug("[log] turn {} interaction saved to: {s}", .{ turn, file_name });
+}
+
+// ---------------------------------------------------------------------------
 // SessionConfig
 // ---------------------------------------------------------------------------
 
@@ -38,204 +182,122 @@ pub const SessionConfig = struct {
     /// API 密钥
     api_key: []const u8 = "",
     /// API 基础 URL
-    api_base: []const u8 = "",
+    base_url: []const u8 = "",
     /// 模型名称
     model: []const u8 = "",
-    /// 上下文窗口大小（token 数）
-    context_window: u32 = 200000,
-    /// 温度参数
-    temperature: f32 = 0.0,
-    /// 最大输出 token 数
+    /// 最大令牌数
     max_tokens: u32 = 4096,
-    /// 是否使用流式响应
-    stream: bool = true,
-    /// 最大重试次数
-    max_retries: u32 = 3,
-    /// 连接超时（毫秒）
-    connect_timeout_ms: u32 = 30000,
-    /// 读取超时（毫秒）
-    read_timeout_ms: u32 = 120000,
-    /// 代理地址
-    proxy: ?[]const u8 = null,
-    /// API 模式（仅 OpenAI 兼容）
+    /// 温度
+    temperature: f32 = 0.7,
+    /// API 模式
     api_mode: ApiMode = .chat_completions,
-    /// 会话类型标识：claude / oai
-    session_type: []const u8 = "claude",
-    /// Anthropic 特有：是否启用 thinking
-    thinking: bool = false,
-    /// Anthropic 特有：thinking budget tokens
-    thinking_budget_tokens: u32 = 10000,
-    /// 系统提示词
-    system_prompt: ?[]const u8 = null,
+    /// 超时时间（毫秒）
+    timeout_ms: u32 = 60000,
+    /// 是否启用交互日志（保存请求/响应数据包到文件）
+    enable_logging: bool = false,
+    /// 日志文件目录（默认为当前目录下的 logs 文件夹）
+    log_dir: []const u8 = "logs",
 };
 
 // ---------------------------------------------------------------------------
-// SessionVTable - 接口模式
+// BaseSession Interface
 // ---------------------------------------------------------------------------
 
-/// Session 虚函数表（接口）
-pub const SessionVTable = struct {
-    /// 获取会话类型名称
-    name: *const fn () []const u8,
-    /// 发送消息并获取响应
-    complete: *const fn (*anyopaque, []const Message, ?[]const ToolDefinition) anyerror!MockResponse,
-    /// 流式发送消息
-    completeStream: *const fn (*anyopaque, []const Message, ?[]const ToolDefinition, *anyopaque, *const fn (*anyopaque, SseEvent) anyerror!void) anyerror!void,
-    /// 获取消息历史
-    getHistory: *const fn (*anyopaque) []const Message,
-    /// 添加消息到历史
-    addMessage: *const fn (*anyopaque, Message) void,
-    /// 清空历史
-    clearHistory: *const fn (*anyopaque) void,
-    /// 压缩历史
-    trimHistory: *const fn (*anyopaque, u32) void,
-    /// 销毁
-    deinit: *const fn (*anyopaque) void,
-};
-
-/// BaseSession - 通用会话包装器
+/// 会话接口
 pub const BaseSession = struct {
-    ptr: *anyopaque,
-    vtable: *const SessionVTable,
+    vtable: *const VTable,
+    data: *anyopaque,
+    allocator: Allocator,
 
-    pub fn name(self: BaseSession) []const u8 {
-        return self.vtable.name();
+    pub const VTable = struct {
+        complete: *const fn (*anyopaque, []const Message, ?[]const ToolDefinition, u32) anyerror!MockResponse,
+        completeStream: *const fn (*anyopaque, []const Message, ?[]const ToolDefinition) anyerror!void,
+        deinit: *const fn (*anyopaque, Allocator) void,
+    };
+
+    pub fn complete(self: *BaseSession, messages: []const Message, tools: ?[]const ToolDefinition, turn: u32) !MockResponse {
+        return self.vtable.complete(self.data, messages, tools, turn);
     }
 
-    pub fn complete(self: BaseSession, messages: []const Message, tools: ?[]const ToolDefinition) anyerror!MockResponse {
-        return self.vtable.complete(self.ptr, messages, tools);
+    pub fn completeStream(self: *BaseSession, messages: []const Message, tools: ?[]const ToolDefinition) !void {
+        return self.vtable.completeStream(self.data, messages, tools);
     }
 
-    pub fn completeStream(
-        self: BaseSession,
-        messages: []const Message,
-        tools: ?[]const ToolDefinition,
-        ctx: *anyopaque,
-        onEvent: *const fn (*anyopaque, SseEvent) anyerror!void,
-    ) anyerror!void {
-        return self.vtable.completeStream(self.ptr, messages, tools, ctx, onEvent);
-    }
-
-    pub fn getHistory(self: BaseSession) []const Message {
-        return self.vtable.getHistory(self.ptr);
-    }
-
-    pub fn addMessage(self: BaseSession, msg: Message) void {
-        self.vtable.addMessage(self.ptr, msg);
-    }
-
-    pub fn clearHistory(self: BaseSession) void {
-        self.vtable.clearHistory(self.ptr);
-    }
-
-    pub fn trimHistory(self: BaseSession, max_messages: u32) void {
-        self.vtable.trimHistory(self.ptr, max_messages);
-    }
-
-    pub fn deinit(self: BaseSession) void {
-        self.vtable.deinit(self.ptr);
+    pub fn deinit(self: *BaseSession) void {
+        self.vtable.deinit(self.data, self.allocator);
+        self.allocator.destroy(self);
     }
 };
 
 // ---------------------------------------------------------------------------
-// ClaudeSession - Anthropic API
+// ClaudeSession
 // ---------------------------------------------------------------------------
 
-/// Anthropic Claude 会话
+/// Claude API 会话
 pub const ClaudeSession = struct {
     allocator: Allocator,
-    config: SessionConfig,
     client: LlmClient,
-    history: std.ArrayList(Message),
-    system_prompt: ?[]const u8 = null,
+    config: SessionConfig,
 
-    pub fn init(allocator: Allocator, config: SessionConfig) !ClaudeSession {
-        const client_config = ClientConfig{
-            .max_retries = config.max_retries,
-            .connect_timeout_ms = config.connect_timeout_ms,
-            .read_timeout_ms = config.read_timeout_ms,
-            .proxy = config.proxy,
-        };
+    pub fn init(allocator: Allocator, config: SessionConfig) ClaudeSession {
         return .{
             .allocator = allocator,
+            .client = LlmClient.init(allocator, .{
+                .base_url = config.base_url,
+                .api_key = config.api_key,
+                .timeout_ms = config.timeout_ms,
+            }),
             .config = config,
-            .client = LlmClient.init(allocator, client_config),
-            .history = std.ArrayList(Message).init(allocator),
-            .system_prompt = config.system_prompt,
         };
     }
 
     pub fn deinit(self: *ClaudeSession) void {
-        for (self.history.items) |*msg| {
-            msg.deinit(self.allocator);
-        }
-        self.history.deinit();
         self.client.deinit();
     }
 
-    /// 构建请求 URL
     fn buildUrl(self: *ClaudeSession) ![]const u8 {
-        var base = self.config.api_base;
-        // 移除末尾的 /
-        while (base.len > 0 and base[base.len - 1] == '/') {
-            base = base[0 .. base.len - 1];
-        }
-        return std.fmt.allocPrint(self.allocator, "{s}/v1/messages", .{base});
+        return std.fmt.allocPrint(self.allocator, "{s}/v1/messages", .{self.client.config.base_url});
     }
 
-    /// 构建请求头
     fn buildHeaders(self: *ClaudeSession) !RequestHeaders {
-        const auth = try std.fmt.allocPrint(
-            self.allocator,
-            "Bearer {s}",
-            .{self.config.api_key},
-        );
         return .{
-            .authorization = auth,
+            .api_key = self.client.config.api_key,
             .content_type = "application/json",
-            .accept = if (self.config.stream) "text/event-stream" else "application/json",
-            .extra = &[_]RequestHeaders.HeaderEntry{
-                .{ .name = "anthropic-version", .value = "2023-06-01" },
-            },
         };
     }
 
-    /// 构建请求体 JSON
-    fn buildRequestBody(
-        self: *ClaudeSession,
-        messages: []const Message,
-        tools: ?[]const ToolDefinition,
-        stream: bool,
-    ) ![]const u8 {
+    fn buildRequestBody(self: *ClaudeSession, messages: []const Message, tools: ?[]const ToolDefinition) ![]const u8 {
         var array = std.ArrayList(u8).init(self.allocator);
-        defer array.deinit();
+        errdefer array.deinit();
 
         try array.appendSlice("{\"model\":\"");
         try array.appendSlice(self.config.model);
         try array.appendSlice("\",\"max_tokens\":");
-        try array.writer().print("{}", .{self.config.max_tokens});
-        try array.appendSlice(",\"stream\":");
-        try array.appendSlice(if (stream) "true" else "false");
-        try array.appendSlice(",\"temperature\":");
-        try array.writer().print("{d}", .{self.config.temperature});
+        var max_tokens_str: []const u8 = "4096";
+        var should_free_max_tokens = false;
+        if (std.fmt.allocPrint(self.allocator, "{}", .{self.config.max_tokens})) |allocated| {
+            max_tokens_str = allocated;
+            should_free_max_tokens = true;
+        } else |_| {}
+        errdefer if (should_free_max_tokens) self.allocator.free(max_tokens_str);
+        try array.appendSlice(max_tokens_str);
 
-        // 添加工具定义（Anthropic Claude 格式）
+        var temp_str: ?[]const u8 = null;
+        if (self.config.temperature >= 0) {
+            try array.appendSlice(",\"temperature\":");
+            temp_str = try std.fmt.allocPrint(self.allocator, "{d}", .{@as(f64, @floatCast(self.config.temperature))});
+            errdefer if (temp_str) |s| self.allocator.free(s);
+            try array.appendSlice(temp_str.?);
+        }
+
         if (tools) |tool_list| {
             try array.appendSlice(",\"tools\":[");
             for (tool_list, 0..) |tool, i| {
                 if (i > 0) try array.appendSlice(",");
                 try array.appendSlice("{\"name\":\"");
-                try array.appendSlice(tool.name);
+                try appendJsonString(&array, tool.name);
                 try array.appendSlice("\",\"description\":\"");
-                for (tool.description) |ch| {
-                    if (ch == '"') {
-                        try array.appendSlice("\\\"");
-                    } else if (ch == '\\') {
-                        try array.appendSlice("\\\\");
-                    } else {
-                        try array.append(ch);
-                    }
-                }
+                try appendJsonString(&array, tool.description);
                 try array.appendSlice("\",\"input_schema\":");
                 try array.appendSlice(tool.parameters);
                 try array.appendSlice("}");
@@ -257,21 +319,7 @@ pub const ClaudeSession = struct {
 
         if (system_content) |sc| {
             try array.appendSlice(",\"system\":\"");
-            for (sc) |ch| {
-                if (ch == '"') {
-                    try array.appendSlice("\\\"");
-                } else if (ch == '\\') {
-                    try array.appendSlice("\\\\");
-                } else if (ch == '\n') {
-                    try array.appendSlice("\\n");
-                } else if (ch == '\r') {
-                    try array.appendSlice("\\r");
-                } else if (ch == '\t') {
-                    try array.appendSlice("\\t");
-                } else {
-                    try array.append(ch);
-                }
-            }
+            try appendJsonString(&array, sc);
             try array.appendSlice("\"");
         }
 
@@ -284,21 +332,7 @@ pub const ClaudeSession = struct {
 
             if (msg.content) |c| {
                 try array.appendSlice("{\"type\":\"text\",\"thinking\":\"\",\"text\":\"");
-                for (c) |ch| {
-                    if (ch == '"') {
-                        try array.appendSlice("\\\"");
-                    } else if (ch == '\\') {
-                        try array.appendSlice("\\\\");
-                    } else if (ch == '\n') {
-                        try array.appendSlice("\\n");
-                    } else if (ch == '\r') {
-                        try array.appendSlice("\\r");
-                    } else if (ch == '\t') {
-                        try array.appendSlice("\\t");
-                    } else {
-                        try array.append(ch);
-                    }
-                }
+                try appendJsonString(&array, c);
                 try array.appendSlice("\"}");
             } else if (msg.content_blocks) |blocks| {
                 for (blocks, 0..) |block, j| {
@@ -307,69 +341,25 @@ pub const ClaudeSession = struct {
                         .text => {
                             try array.appendSlice("{\"type\":\"text\",\"thinking\":\"\",\"text\":\"");
                             if (block.text) |text| {
-                                for (text) |ch| {
-                                    if (ch == '"') {
-                                        try array.appendSlice("\\\"");
-                                    } else if (ch == '\\') {
-                                        try array.appendSlice("\\\\");
-                                    } else if (ch == '\n') {
-                                        try array.appendSlice("\\n");
-                                    } else if (ch == '\r') {
-                                        try array.appendSlice("\\r");
-                                    } else if (ch == '\t') {
-                                        try array.appendSlice("\\t");
-                                    } else {
-                                        try array.append(ch);
-                                    }
-                                }
+                                try appendJsonString(&array, text);
                             }
                             try array.appendSlice("\"}");
                         },
                         .thinking => {
                             try array.appendSlice("{\"type\":\"thinking\",\"thinking\":\"\",\"text\":\"");
                             if (block.text) |text| {
-                                for (text) |ch| {
-                                    if (ch == '"') {
-                                        try array.appendSlice("\\\"");
-                                    } else if (ch == '\\') {
-                                        try array.appendSlice("\\\\");
-                                    } else if (ch == '\n') {
-                                        try array.appendSlice("\\n");
-                                    } else if (ch == '\r') {
-                                        try array.appendSlice("\\r");
-                                    } else if (ch == '\t') {
-                                        try array.appendSlice("\\t");
-                                    } else {
-                                        try array.append(ch);
-                                    }
-                                }
+                                try appendJsonString(&array, text);
                             }
                             try array.appendSlice("\"}");
                         },
                         .tool_use => {
                             try array.appendSlice("{\"type\":\"tool_use\",\"thinking\":\"\",\"id\":\"");
                             if (block.id) |id| {
-                                for (id) |ch| {
-                                    if (ch == '"') {
-                                        try array.appendSlice("\\\"");
-                                    } else if (ch == '\\') {
-                                        try array.appendSlice("\\\\");
-                                    } else {
-                                        try array.append(ch);
-                                    }
-                                }
+                                try appendJsonString(&array, id);
                             }
                             try array.appendSlice("\",\"name\":\"");
                             if (block.name) |name| {
-                                for (name) |ch| {
-                                    if (ch == '"') {
-                                        try array.appendSlice("\\\"");
-                                    } else if (ch == '\\') {
-                                        try array.appendSlice("\\\\");
-                                    } else {
-                                        try array.append(ch);
-                                    }
-                                }
+                                try appendJsonString(&array, name);
                             }
                             try array.appendSlice("\",\"input\":");
                             if (block.input) |input| {
@@ -384,60 +374,22 @@ pub const ClaudeSession = struct {
                         .image => {
                             try array.appendSlice("{\"type\":\"image\",\"thinking\":\"\",\"source\":{\"type\":\"base64\",\"media_type\":\"");
                             if (block.media_type) |media_type| {
-                                for (media_type) |ch| {
-                                    if (ch == '"') {
-                                        try array.appendSlice("\\\"");
-                                    } else if (ch == '\\') {
-                                        try array.appendSlice("\\\\");
-                                    } else {
-                                        try array.append(ch);
-                                    }
-                                }
+                                try appendJsonString(&array, media_type);
                             }
                             try array.appendSlice("\",\"data\":\"");
                             if (block.data) |data| {
-                                for (data) |ch| {
-                                    if (ch == '"') {
-                                        try array.appendSlice("\\\"");
-                                    } else if (ch == '\\') {
-                                        try array.appendSlice("\\\\");
-                                    } else {
-                                        try array.append(ch);
-                                    }
-                                }
+                                try appendJsonString(&array, data);
                             }
                             try array.appendSlice("\"}}");
                         },
                         .tool_result => {
                             try array.appendSlice("{\"type\":\"tool_result\",\"thinking\":\"\",\"tool_use_id\":\"");
                             if (block.tool_use_id) |tool_use_id| {
-                                for (tool_use_id) |ch| {
-                                    if (ch == '"') {
-                                        try array.appendSlice("\\\"");
-                                    } else if (ch == '\\') {
-                                        try array.appendSlice("\\\\");
-                                    } else {
-                                        try array.append(ch);
-                                    }
-                                }
+                                try appendJsonString(&array, tool_use_id);
                             }
                             try array.appendSlice("\",\"content\":\"");
                             if (block.content) |content| {
-                                for (content) |ch| {
-                                    if (ch == '"') {
-                                        try array.appendSlice("\\\"");
-                                    } else if (ch == '\\') {
-                                        try array.appendSlice("\\\\");
-                                    } else if (ch == '\n') {
-                                        try array.appendSlice("\\n");
-                                    } else if (ch == '\r') {
-                                        try array.appendSlice("\\r");
-                                    } else if (ch == '\t') {
-                                        try array.appendSlice("\\t");
-                                    } else {
-                                        try array.append(ch);
-                                    }
-                                }
+                                try appendJsonString(&array, content);
                             }
                             try array.appendSlice("\"}");
                         },
@@ -448,154 +400,146 @@ pub const ClaudeSession = struct {
         }
         try array.appendSlice("]}");
 
+        if (should_free_max_tokens) {
+            self.allocator.free(max_tokens_str);
+        }
+        if (temp_str) |s| {
+            self.allocator.free(s);
+        }
+
         return array.toOwnedSlice();
     }
 
-    /// 发送请求（非流式）
-    pub fn complete(self: *ClaudeSession, messages: []const Message, tools: ?[]const ToolDefinition) !MockResponse {
+    pub fn complete(self: *ClaudeSession, messages: []const Message, tools: ?[]const ToolDefinition, turn: u32) !MockResponse {
         const url = try self.buildUrl();
         defer self.allocator.free(url);
 
         const headers = try self.buildHeaders();
-        defer if (headers.authorization) |auth| self.allocator.free(auth);
-        const body = try self.buildRequestBody(messages, tools, false);
+
+        const body = try self.buildRequestBody(messages, tools);
         defer self.allocator.free(body);
 
-        const result = self.client.post(url, headers, body) catch |err| {
-            std.log.err("Claude request failed: {}", .{err});
-            return err;
-        };
-        defer self.allocator.free(result.body);
+        const response = try self.client.post(url, headers, body);
+        defer self.allocator.free(response.body);
 
-        if (result.body.len == 0) {
-            std.log.err("Empty response body", .{});
-            return LlmError.InvalidResponse;
+        // 记录交互日志
+        if (self.config.enable_logging) {
+            saveInteractionLog(self.allocator, self.config.log_dir, turn, body, response.body, response.status_code);
         }
 
-        return self.parseResponse(result.body);
+        return try parseClaudeResponse(self.allocator, response.body);
     }
 
-    /// 发送请求（流式）
-    pub fn completeStream(
-        self: *ClaudeSession,
-        messages: []const Message,
-        tools: ?[]const ToolDefinition,
-        ctx: *anyopaque,
-        onEvent: *const fn (*anyopaque, SseEvent) anyerror!void,
-    ) !void {
-        const url = try self.buildUrl();
+    pub fn completeStream(self: *ClaudeSession, messages: []const Message, tools: ?[]const ToolDefinition) !void {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/v1/messages", .{self.client.config.base_url});
         defer self.allocator.free(url);
 
         const headers = try self.buildHeaders();
-        defer if (headers.authorization) |auth| self.allocator.free(auth);
-        const body = try self.buildRequestBody(messages, tools, true);
+
+        const body = try self.buildRequestBody(messages, tools);
         defer self.allocator.free(body);
 
-        return self.client.postStream(url, headers, body, ctx, onEvent);
+        try self.client.postStream(url, headers, body, self, handleSseEvent);
     }
 
-    /// 解析 Claude API 响应
-    fn parseResponse(self: *ClaudeSession, body: []const u8) !MockResponse {
-        var parsed = json.parseFromSlice(json.Value, self.allocator, body, .{}) catch
-            return LlmError.JsonParseError;
+    pub fn asBase(self: *ClaudeSession) BaseSession {
+        return .{
+            .vtable = &claude_vtable,
+            .data = self,
+        };
+    }
+
+    fn parseClaudeResponse(allocator: Allocator, body: []const u8) !MockResponse {
+        var parsed = try json.parseFromSlice(json.Value, allocator, body, .{});
         defer parsed.deinit();
 
-        const root = parsed.value;
-        var response = MockResponse{};
+        var response: MockResponse = .{};
 
-        // 解析 stop_reason
-        if (root.object.get("stop_reason")) |sr| {
-            if (sr == .string) {
-                response.stop_reason = StopReason.fromString(sr.string);
-            }
-        }
+        if (parsed.value == .object) {
+            const obj = parsed.value.object;
+            if (obj.get("content")) |content_val| {
+                if (content_val == .array) {
+                    var content_str = std.ArrayList(u8).init(allocator);
+                    defer content_str.deinit();
 
-        // 解析 content 数组
-        if (root.object.get("content")) |content_arr| {
-            if (content_arr == .array) {
-                var thinking_buf = std.ArrayList(u8).init(self.allocator);
-                defer thinking_buf.deinit();
-                var content_buf = std.ArrayList(u8).init(self.allocator);
-                defer content_buf.deinit();
-                var tool_calls_list = std.ArrayList(ToolCall).init(self.allocator);
+                    var tool_calls = std.ArrayList(types.ToolCall).init(allocator);
+                    defer {
+                        for (tool_calls.items) |*tc| tc.deinit(allocator);
+                        tool_calls.deinit();
+                    }
 
-                for (content_arr.array.items) |item| {
-                    if (item == .object) {
-                        const block_type = item.object.get("type") orelse continue;
-                        if (block_type != .string) continue;
+                    for (content_val.array.items) |item| {
+                        if (item == .object) {
+                            const item_obj = item.object;
+                            if (item_obj.get("type")) |type_val| {
+                                if (type_val == .string) {
+                                    if (std.mem.eql(u8, type_val.string, "text")) {
+                                        if (item_obj.get("text")) |text_val| {
+                                            if (text_val == .string) {
+                                                try content_str.appendSlice(text_val.string);
+                                            }
+                                        }
+                                    } else if (std.mem.eql(u8, type_val.string, "tool_use")) {
+                                        var tc: types.ToolCall = undefined;
 
-                        if (std.mem.eql(u8, block_type.string, "thinking")) {
-                            // 首先从 thinking 字段读取（原始 Claude API）
-                            if (item.object.get("thinking")) |thinking_val| {
-                                if (thinking_val == .string and thinking_val.string.len > 0) {
-                                    if (thinking_buf.items.len > 0) {
-                                        thinking_buf.append('\n') catch {};
+                                        // 解析 id
+                                        if (item_obj.get("id")) |id_val| {
+                                            if (id_val == .string) {
+                                                tc.id = try allocator.dupe(u8, id_val.string);
+                                            } else {
+                                                tc.id = try allocator.dupe(u8, "");
+                                            }
+                                        } else {
+                                            tc.id = try allocator.dupe(u8, "");
+                                        }
+
+                                        // 解析 name
+                                        if (item_obj.get("name")) |name_val| {
+                                            if (name_val == .string) {
+                                                tc.name = try allocator.dupe(u8, name_val.string);
+                                            } else {
+                                                tc.name = try allocator.dupe(u8, "");
+                                            }
+                                        } else {
+                                            tc.name = try allocator.dupe(u8, "");
+                                        }
+
+                                        // 解析 input（作为 arguments）
+                                        if (item_obj.get("input")) |input_val| {
+                                            // 需要复制 JSON 值，因为 parsed.deinit() 会释放原始数据
+                                            const args_str = std.json.stringifyAlloc(allocator, input_val, .{}) catch "{}";
+                                            defer allocator.free(args_str);
+                                            const parsed_args = std.json.parseFromSlice(json.Value, allocator, args_str, .{}) catch {
+                                                tc.arguments = .null;
+                                                continue;
+                                            };
+                                            // 不调用 parsed_args.deinit()，将所有权转移给 tc.arguments
+                                            // ToolCall.deinit() 会负责释放它
+                                            tc.arguments = parsed_args.value;
+                                        } else {
+                                            tc.arguments = .null;
+                                        }
+
+                                        try tool_calls.append(tc);
                                     }
-                                    thinking_buf.appendSlice(thinking_val.string) catch {};
                                 }
                             }
-                            // 如果 thinking 字段为空，尝试从 text 字段读取（DeepSeek Claude API 可能使用这种格式）
-                            if (thinking_buf.items.len == 0) {
-                                if (item.object.get("text")) |thinking_val| {
-                                    if (thinking_val == .string) {
-                                        thinking_buf.appendSlice(thinking_val.string) catch {};
-                                    }
-                                }
-                            }
-                        } else if (std.mem.eql(u8, block_type.string, "text")) {
-                            if (item.object.get("text")) |text_val| {
-                                if (text_val == .string) {
-                                    if (content_buf.items.len > 0) {
-                                        content_buf.append('\n') catch {};
-                                    }
-                                    content_buf.appendSlice(text_val.string) catch {};
-                                }
-                            }
-                        } else if (std.mem.eql(u8, block_type.string, "tool_use")) {
-                            const id_val = item.object.get("id");
-                            const name_val = item.object.get("name");
-                            const input_val = item.object.get("input");
-
-                            const id_str = if (id_val != null and id_val.? == .string)
-                                try self.allocator.dupe(u8, id_val.?.string)
-                            else
-                                try self.allocator.dupe(u8, "");
-                            errdefer self.allocator.free(id_str);
-
-                            const name_str = if (name_val != null and name_val.? == .string)
-                                try self.allocator.dupe(u8, name_val.?.string)
-                            else
-                                try self.allocator.dupe(u8, "");
-                            errdefer self.allocator.free(name_str);
-
-                            const input_copy = if (input_val != null) blk: {
-                                const serialized = std.json.stringifyAlloc(self.allocator, input_val.?, .{}) catch
-                                    break :blk json.Value.null;
-                                defer self.allocator.free(serialized);
-                                const cloned = std.json.parseFromSlice(json.Value, self.allocator, serialized, .{}) catch
-                                    break :blk json.Value.null;
-                                defer cloned.deinit();
-                                break :blk cloned.value;
-                            } else json.Value.null;
-                            // Note: json.dynamic.Value does not have deinit; memory managed by arena allocator
-
-                            try tool_calls_list.append(.{
-                                .id = id_str,
-                                .name = name_str,
-                                .arguments = input_copy,
-                            });
                         }
                     }
-                }
 
-                if (thinking_buf.items.len > 0) {
-                    response.thinking = thinking_buf.toOwnedSlice() catch null;
+                    if (content_str.items.len > 0) {
+                        response.content = try content_str.toOwnedSlice();
+                    }
+
+                    if (tool_calls.items.len > 0) {
+                        response.tool_calls = try tool_calls.toOwnedSlice();
+                    }
                 }
-                if (content_buf.items.len > 0) {
-                    response.content = content_buf.toOwnedSlice() catch null;
-                }
-                if (tool_calls_list.items.len > 0) {
-                    response.tool_calls = tool_calls_list.toOwnedSlice() catch null;
+            }
+
+            if (obj.get("stop_reason")) |stop_val| {
+                if (stop_val == .string) {
+                    response.stop_reason = types.StopReason.fromString(stop_val.string);
                 }
             }
         }
@@ -603,345 +547,307 @@ pub const ClaudeSession = struct {
         return response;
     }
 
-    // -- 历史管理 --
-
-    pub fn getHistory(self: *ClaudeSession) []const Message {
-        return self.history.items;
-    }
-
-    pub fn addMessage(self: *ClaudeSession, msg: Message) void {
-        self.history.append(msg) catch {};
-    }
-
-    pub fn clearHistory(self: *ClaudeSession) void {
-        for (self.history.items) |*msg| {
-            msg.deinit(self.allocator);
-        }
-        self.history.clearRetainingCapacity();
-    }
-
-    /// 压缩消息历史，保留最近的 max_messages 条
-    pub fn trimHistory(self: *ClaudeSession, max_messages: u32) void {
-        if (self.history.items.len <= max_messages) return;
-
-        const start = self.history.items.len - @as(usize, max_messages);
-        // 释放被裁剪的消息
-        for (self.history.items[0..start]) |*msg| {
-            msg.deinit(self.allocator);
-        }
-        // 将保留的消息移到前面
-        const remaining = self.history.items[start..];
-        std.mem.copyForwards(Message, self.history.items, remaining);
-        self.history.items.len = remaining.len;
-    }
-
-    /// 转换为 BaseSession
-    pub fn toBaseSession(self: *ClaudeSession) BaseSession {
-        return .{
-            .ptr = self,
-            .vtable = &claude_vtable,
-        };
+    fn handleSseEvent(ctx: *anyopaque, event: client_mod.SseEvent) anyerror!void {
+        _ = ctx;
+        _ = event;
     }
 };
 
-// Claude vtable 实现
-const claude_vtable = SessionVTable{
-    .name = claudeSessionName,
-    .complete = claudeSessionComplete,
-    .completeStream = claudeSessionCompleteStream,
-    .getHistory = claudeSessionGetHistory,
-    .addMessage = claudeSessionAddMessage,
-    .clearHistory = claudeSessionClearHistory,
-    .trimHistory = claudeSessionTrimHistory,
-    .deinit = claudeSessionDeinit,
+const claude_vtable = BaseSession.VTable{
+    .complete = struct {
+        fn impl(data: *anyopaque, messages: []const Message, tools: ?[]const ToolDefinition, turn: u32) anyerror!MockResponse {
+            const self: *ClaudeSession = @ptrCast(@alignCast(data));
+            return self.complete(messages, tools, turn);
+        }
+    }.impl,
+    .completeStream = struct {
+        fn impl(data: *anyopaque, messages: []const Message, tools: ?[]const ToolDefinition) anyerror!void {
+            const self: *ClaudeSession = @ptrCast(@alignCast(data));
+            return self.completeStream(messages, tools);
+        }
+    }.impl,
+    .deinit = struct {
+        fn impl(data: *anyopaque, allocator: Allocator) void {
+            const self: *ClaudeSession = @ptrCast(@alignCast(data));
+            self.deinit();
+            allocator.destroy(self);
+        }
+    }.impl,
 };
 
-fn claudeSessionName() []const u8 {
-    return "claude";
-}
-
-fn claudeSessionComplete(ptr: *anyopaque, messages: []const Message, tools: ?[]const ToolDefinition) anyerror!MockResponse {
-    const self: *ClaudeSession = @ptrCast(@alignCast(ptr));
-    return self.complete(messages, tools);
-}
-
-fn claudeSessionCompleteStream(
-    ptr: *anyopaque,
-    messages: []const Message,
-    tools: ?[]const ToolDefinition,
-    ctx: *anyopaque,
-    onEvent: *const fn (*anyopaque, SseEvent) anyerror!void,
-) anyerror!void {
-    const self: *ClaudeSession = @ptrCast(@alignCast(ptr));
-    return self.completeStream(messages, tools, ctx, onEvent);
-}
-
-fn claudeSessionGetHistory(ptr: *anyopaque) []const Message {
-    const self: *ClaudeSession = @ptrCast(@alignCast(ptr));
-    return self.getHistory();
-}
-
-fn claudeSessionAddMessage(ptr: *anyopaque, msg: Message) void {
-    const self: *ClaudeSession = @ptrCast(@alignCast(ptr));
-    self.addMessage(msg);
-}
-
-fn claudeSessionClearHistory(ptr: *anyopaque) void {
-    const self: *ClaudeSession = @ptrCast(@alignCast(ptr));
-    self.clearHistory();
-}
-
-fn claudeSessionTrimHistory(ptr: *anyopaque, max_messages: u32) void {
-    const self: *ClaudeSession = @ptrCast(@alignCast(ptr));
-    self.trimHistory(max_messages);
-}
-
-fn claudeSessionDeinit(ptr: *anyopaque) void {
-    const self: *ClaudeSession = @ptrCast(@alignCast(ptr));
-    self.deinit();
-    self.allocator.destroy(self);
-}
-
 // ---------------------------------------------------------------------------
-// OaiSession - OpenAI 兼容 API
+// OaiSession (OpenAI compatible)
 // ---------------------------------------------------------------------------
 
-/// OpenAI 兼容会话（支持 chat/completions 和 responses 两种模式）
+/// OpenAI 兼容 API 会话
 pub const OaiSession = struct {
     allocator: Allocator,
-    config: SessionConfig,
     client: LlmClient,
-    history: std.ArrayList(Message),
-    system_prompt: ?[]const u8 = null,
+    config: SessionConfig,
 
-    pub fn init(allocator: Allocator, config: SessionConfig) !OaiSession {
-        const client_config = ClientConfig{
-            .max_retries = config.max_retries,
-            .connect_timeout_ms = config.connect_timeout_ms,
-            .read_timeout_ms = config.read_timeout_ms,
-            .proxy = config.proxy,
-        };
+    pub fn init(allocator: Allocator, config: SessionConfig) OaiSession {
         return .{
             .allocator = allocator,
+            .client = LlmClient.init(allocator, .{
+                .base_url = config.base_url,
+                .api_key = config.api_key,
+                .timeout_ms = config.timeout_ms,
+            }),
             .config = config,
-            .client = LlmClient.init(allocator, client_config),
-            .history = std.ArrayList(Message).init(allocator),
-            .system_prompt = config.system_prompt,
         };
     }
 
     pub fn deinit(self: *OaiSession) void {
-        for (self.history.items) |*msg| {
-            msg.deinit(self.allocator);
-        }
-        self.history.deinit();
         self.client.deinit();
     }
 
-    /// 构建请求 URL
     fn buildUrl(self: *OaiSession) ![]const u8 {
-        var base = self.config.api_base;
-        while (base.len > 0 and base[base.len - 1] == '/') {
-            base = base[0 .. base.len - 1];
-        }
-        return switch (self.config.api_mode) {
-            .chat_completions => std.fmt.allocPrint(
-                self.allocator,
-                "{s}/v1/chat/completions",
-                .{base},
-            ),
-            .responses => std.fmt.allocPrint(
-                self.allocator,
-                "{s}/v1/responses",
-                .{base},
-            ),
-        };
+        return std.fmt.allocPrint(self.allocator, "{s}/v1/chat/completions", .{self.client.config.base_url});
     }
 
-    /// 构建请求头
     fn buildHeaders(self: *OaiSession) !RequestHeaders {
-        const auth = try std.fmt.allocPrint(
-            self.allocator,
-            "Bearer {s}",
-            .{self.config.api_key},
-        );
         return .{
-            .authorization = auth,
+            .api_key = self.client.config.api_key,
             .content_type = "application/json",
-            .accept = if (self.config.stream) "text/event-stream" else "application/json",
         };
     }
 
-    /// 构建 chat/completions 请求体
-    fn buildChatCompletionsBody(
-        self: *OaiSession,
-        messages: []const Message,
-        tools: ?[]const ToolDefinition,
-    ) ![]const u8 {
-        _ = tools;
-        _ = messages;
-        return std.json.stringifyAlloc(self.allocator, .{
-            .model = self.config.model,
-            .max_tokens = self.config.max_tokens,
-            .stream = self.config.stream,
-            .temperature = self.config.temperature,
-        }, .{}) catch return LlmError.AllocationFailed;
+    fn buildRequestBody(self: *OaiSession, messages: []const Message, tools: ?[]const ToolDefinition) ![]const u8 {
+        var array = std.ArrayList(u8).init(self.allocator);
+        errdefer array.deinit();
+
+        try array.appendSlice("{\"model\":\"");
+        try array.appendSlice(self.config.model);
+        try array.appendSlice("\",\"max_tokens\":");
+        var max_tokens_str: []const u8 = "4096";
+        var should_free_max_tokens = false;
+        if (std.fmt.allocPrint(self.allocator, "{}", .{self.config.max_tokens})) |allocated| {
+            max_tokens_str = allocated;
+            should_free_max_tokens = true;
+        } else |_| {}
+        errdefer if (should_free_max_tokens) self.allocator.free(max_tokens_str);
+        try array.appendSlice(max_tokens_str);
+
+        var temp_str: ?[]const u8 = null;
+        if (self.config.temperature >= 0) {
+            try array.appendSlice(",\"temperature\":");
+            temp_str = try std.fmt.allocPrint(self.allocator, "{d}", .{@as(f64, @floatCast(self.config.temperature))});
+            errdefer if (temp_str) |s| self.allocator.free(s);
+            try array.appendSlice(temp_str.?);
+        }
+
+        if (tools) |tool_list| {
+            try array.appendSlice(",\"tools\":[");
+            for (tool_list, 0..) |tool, i| {
+                if (i > 0) try array.appendSlice(",");
+                try array.appendSlice("{\"type\":\"function\",\"function\":{\"name\":\"");
+                try appendJsonString(&array, tool.name);
+                try array.appendSlice("\",\"description\":\"");
+                try appendJsonString(&array, tool.description);
+                try array.appendSlice("\",\"parameters\":");
+                try array.appendSlice(tool.parameters);
+                try array.appendSlice("}}");
+            }
+            try array.appendSlice("]");
+        }
+
+        try array.appendSlice(",\"messages\":[");
+        for (messages, 0..) |msg, i| {
+            if (i > 0) try array.appendSlice(",");
+            try array.appendSlice("{\"role\":\"");
+            try array.appendSlice(msg.role.toString());
+            try array.appendSlice("\",\"content\":");
+
+            if (msg.content) |c| {
+                try array.appendSlice("\"");
+                try appendJsonString(&array, c);
+                try array.appendSlice("\"");
+            } else if (msg.content_blocks) |blocks| {
+                try array.appendSlice("[");
+                for (blocks, 0..) |block, j| {
+                    if (j > 0) try array.appendSlice(",");
+                    switch (block.tag) {
+                        .text => {
+                            try array.appendSlice("{\"type\":\"text\",\"text\":\"");
+                            if (block.text) |text| {
+                                try appendJsonString(&array, text);
+                            }
+                            try array.appendSlice("\"}");
+                        },
+                        .thinking => {
+                            try array.appendSlice("{\"type\":\"text\",\"text\":\"");
+                            if (block.text) |text| {
+                                try appendJsonString(&array, text);
+                            }
+                            try array.appendSlice("\"}");
+                        },
+                        .tool_use => {
+                            try array.appendSlice("{\"tool_call\":{\"id\":\"");
+                            if (block.id) |id| {
+                                try appendJsonString(&array, id);
+                            }
+                            try array.appendSlice("\",\"type\":\"function\",\"function\":{\"name\":\"");
+                            if (block.name) |name| {
+                                try appendJsonString(&array, name);
+                            }
+                            try array.appendSlice("\",\"arguments\":");
+                            if (block.input) |input| {
+                                const args_json = std.json.stringifyAlloc(self.allocator, input, .{}) catch "{}";
+                                defer self.allocator.free(args_json);
+                                try array.appendSlice(args_json);
+                            } else {
+                                try array.appendSlice("{}");
+                            }
+                            try array.appendSlice("}}}");
+                        },
+                        .image => {
+                            try array.appendSlice("{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
+                            if (block.media_type) |media_type| {
+                                try appendJsonString(&array, media_type);
+                            }
+                            try array.appendSlice(";base64,");
+                            if (block.data) |data| {
+                                try appendJsonString(&array, data);
+                            }
+                            try array.appendSlice("\"}}");
+                        },
+                        .tool_result => {
+                            try array.appendSlice("{\"type\":\"text\",\"text\":\"");
+                            if (block.content) |content| {
+                                try appendJsonString(&array, content);
+                            }
+                            try array.appendSlice("\"}");
+                        },
+                    }
+                }
+                try array.appendSlice("]");
+            }
+            try array.appendSlice("}");
+        }
+        try array.appendSlice("]");
+
+        if (should_free_max_tokens) {
+            self.allocator.free(max_tokens_str);
+        }
+        if (temp_str) |s| {
+            self.allocator.free(s);
+        }
+
+        return array.toOwnedSlice();
     }
 
-    /// 构建 responses API 请求体
-    fn buildResponsesBody(
-        self: *OaiSession,
-        messages: []const Message,
-        tools: ?[]const ToolDefinition,
-    ) ![]const u8 {
-        _ = tools;
-        _ = messages;
-        return std.json.stringifyAlloc(self.allocator, .{
-            .model = self.config.model,
-            .max_output_tokens = self.config.max_tokens,
-            .stream = self.config.stream,
-            .temperature = self.config.temperature,
-        }, .{}) catch return LlmError.AllocationFailed;
-    }
-
-    /// 发送请求（非流式）
-    pub fn complete(self: *OaiSession, messages: []const Message, tools: ?[]const ToolDefinition) !MockResponse {
+    pub fn complete(self: *OaiSession, messages: []const Message, tools: ?[]const ToolDefinition, turn: u32) !MockResponse {
         const url = try self.buildUrl();
         defer self.allocator.free(url);
 
         const headers = try self.buildHeaders();
-        defer if (headers.authorization) |auth| self.allocator.free(auth);
 
-        const body = switch (self.config.api_mode) {
-            .chat_completions => try self.buildChatCompletionsBody(messages, tools),
-            .responses => try self.buildResponsesBody(messages, tools),
-        };
+        const body = try self.buildRequestBody(messages, tools);
         defer self.allocator.free(body);
 
-        const result = self.client.post(url, headers, body) catch |err| {
-            std.log.err("OAI request failed: {}", .{err});
-            return err;
-        };
-        defer self.allocator.free(result.body);
+        const response = try self.client.post(url, headers, body);
+        defer self.allocator.free(response.body);
 
-        return self.parseResponse(result.body);
+        // 记录交互日志
+        if (self.config.enable_logging) {
+            saveInteractionLog(self.allocator, self.config.log_dir, turn, body, response.body, response.status_code);
+        }
+
+        return try parseOaiResponse(self.allocator, response.body);
     }
 
-    /// 发送请求（流式）
-    pub fn completeStream(
-        self: *OaiSession,
-        messages: []const Message,
-        tools: ?[]const ToolDefinition,
-        ctx: *anyopaque,
-        onEvent: *const fn (*anyopaque, SseEvent) anyerror!void,
-    ) !void {
+    pub fn completeStream(self: *OaiSession, messages: []const Message, tools: ?[]const ToolDefinition) !void {
         const url = try self.buildUrl();
         defer self.allocator.free(url);
 
         const headers = try self.buildHeaders();
-        defer if (headers.authorization) |auth| self.allocator.free(auth);
 
-        const body = switch (self.config.api_mode) {
-            .chat_completions => try self.buildChatCompletionsBody(messages, tools),
-            .responses => try self.buildResponsesBody(messages, tools),
-        };
+        const body = try self.buildRequestBody(messages, tools);
         defer self.allocator.free(body);
 
-        return self.client.postStream(url, headers, body, ctx, onEvent);
+        try self.client.postStream(url, headers, body, self, handleOaiSseEvent);
     }
 
-    /// 解析 OpenAI 兼容 API 响应
-    fn parseResponse(self: *OaiSession, body: []const u8) !MockResponse {
-        var parsed = json.parseFromSlice(json.Value, self.allocator, body, .{}) catch
-            return LlmError.JsonParseError;
+    fn parseOaiResponse(allocator: Allocator, body: []const u8) !MockResponse {
+        var parsed = try json.parseFromSlice(json.Value, allocator, body, .{});
         defer parsed.deinit();
 
-        const root = parsed.value;
-        var response = MockResponse{};
+        var response: MockResponse = .{};
 
-        // 解析 choices
-        if (root.object.get("choices")) |choices| {
-            if (choices == .array and choices.array.items.len > 0) {
-                const choice = choices.array.items[0];
-                if (choice == .object) {
-                    // finish_reason
-                    if (choice.object.get("finish_reason")) |fr| {
-                        if (fr == .string) {
-                            response.stop_reason = StopReason.fromString(fr.string);
-                        }
-                    }
-
-                    // message
-                    if (choice.object.get("message")) |msg| {
-                        if (msg == .object) {
-                            // reasoning_content (DeepSeek 等)
-                            if (msg.object.get("reasoning_content")) |rc| {
-                                if (rc == .string and rc.string.len > 0) {
-                                    response.thinking = try self.allocator.dupe(u8, rc.string);
+        if (parsed.value == .object) {
+            const obj = parsed.value.object;
+            if (obj.get("choices")) |choices_val| {
+                if (choices_val == .array and choices_val.array.items.len > 0) {
+                    const choice = choices_val.array.items[0];
+                    if (choice == .object) {
+                        const choice_obj = choice.object;
+                        if (choice_obj.get("message")) |msg_val| {
+                            if (msg_val == .object) {
+                                const msg_obj = msg_val.object;
+                                if (msg_obj.get("content")) |content_val| {
+                                    if (content_val == .string) {
+                                        response.content = try allocator.dupe(u8, content_val.string);
+                                    }
                                 }
-                            }
+                                if (msg_obj.get("tool_calls")) |tool_calls_val| {
+                                    if (tool_calls_val == .array) {
+                                        var tool_calls = std.ArrayList(types.ToolCall).init(allocator);
+                                        defer tool_calls.deinit();
 
-                            // content
-                            if (msg.object.get("content")) |content_val| {
-                                if (content_val == .string and content_val.string.len > 0) {
-                                    response.content = try self.allocator.dupe(u8, content_val.string);
-                                }
-                            }
-
-                            // tool_calls
-                            if (msg.object.get("tool_calls")) |tc| {
-                                if (tc == .array and tc.array.items.len > 0) {
-                                    var tool_calls_list = std.ArrayList(ToolCall).init(self.allocator);
-                                    for (tc.array.items) |tc_item| {
-                                        if (tc_item == .object) {
-                                            const tc_id = tc_item.object.get("id");
-                                            const tc_fn = tc_item.object.get("function");
-                                            if (tc_fn != null and tc_fn.? == .object) {
-                                                const fn_name = tc_fn.?.object.get("name");
-                                                const fn_args = tc_fn.?.object.get("arguments");
-
-                                                const id_str = if (tc_id != null and tc_id.? == .string)
-                                                    try self.allocator.dupe(u8, tc_id.?.string)
-                                                else
-                                                    try self.allocator.dupe(u8, "");
-                                                errdefer self.allocator.free(id_str);
-
-                                                const name_str = if (fn_name != null and fn_name.? == .string)
-                                                    try self.allocator.dupe(u8, fn_name.?.string)
-                                                else
-                                                    try self.allocator.dupe(u8, "");
-                                                errdefer self.allocator.free(name_str);
-
-                                                var args_val: json.Value = .null;
-                                                if (fn_args != null) {
-                                                    if (fn_args.? == .string) {
-                                                        const args_parsed = json.parseFromSlice(
-                                                            json.Value,
-                                                            self.allocator,
-                                                            fn_args.?.string,
-                                                            .{},
-                                                        ) catch continue;
-                                                        args_val = args_parsed.value;
+                                        for (tool_calls_val.array.items) |tc_val| {
+                                            if (tc_val == .object) {
+                                                const tc_obj = tc_val.object;
+                                                var tc: types.ToolCall = undefined;
+                                                if (tc_obj.get("id")) |id_val| {
+                                                    if (id_val == .string) {
+                                                        tc.id = try allocator.dupe(u8, id_val.string);
                                                     } else {
-                                                        const serialized = std.json.stringifyAlloc(self.allocator, fn_args.?, .{}) catch continue;
-                                                        const args_parsed2 = std.json.parseFromSlice(json.Value, self.allocator, serialized, .{}) catch continue;
-                                                        args_val = args_parsed2.value;
+                                                        tc.id = try allocator.dupe(u8, "");
                                                     }
+                                                } else {
+                                                    tc.id = try allocator.dupe(u8, "");
                                                 }
-                                                // Note: json.dynamic.Value does not have deinit; memory managed by arena allocator
-
-                                                try tool_calls_list.append(.{
-                                                    .id = id_str,
-                                                    .name = name_str,
-                                                    .arguments = args_val,
-                                                });
+                                                if (tc_obj.get("function")) |func_val| {
+                                                    if (func_val == .object) {
+                                                        const func_obj = func_val.object;
+                                                        if (func_obj.get("name")) |name_val| {
+                                                            if (name_val == .string) {
+                                                                tc.name = try allocator.dupe(u8, name_val.string);
+                                                            } else {
+                                                                tc.name = try allocator.dupe(u8, "");
+                                                            }
+                                                        } else {
+                                                            tc.name = try allocator.dupe(u8, "");
+                                                        }
+                                                        if (func_obj.get("arguments")) |args_val| {
+                                                            const args_str = std.json.stringifyAlloc(allocator, args_val, .{}) catch "{}";
+                                                            defer allocator.free(args_str);
+                                                            const parsed_args = std.json.parseFromSlice(json.Value, allocator, args_str, .{}) catch |_| {
+                                                                tc.arguments = .null;
+                                                            };
+                                                            tc.arguments = parsed_args.value;
+                                                        } else {
+                                                            tc.arguments = .null;
+                                                        }
+                                                    } else {
+                                                        tc.name = try allocator.dupe(u8, "");
+                                                        tc.arguments = .null;
+                                                    }
+                                                } else {
+                                                    tc.name = try allocator.dupe(u8, "");
+                                                    tc.arguments = .null;
+                                                }
+                                                try tool_calls.append(tc);
                                             }
                                         }
-                                    }
-                                    if (tool_calls_list.items.len > 0) {
-                                        response.tool_calls = tool_calls_list.toOwnedSlice() catch null;
+                                        response.tool_calls = try tool_calls.toOwnedSlice();
                                     }
                                 }
+                            }
+                        }
+                        if (choice_obj.get("finish_reason")) |reason_val| {
+                            if (reason_val == .string) {
+                                response.stop_reason = types.StopReason.fromString(reason_val.string);
                             }
                         }
                     }
@@ -952,203 +858,69 @@ pub const OaiSession = struct {
         return response;
     }
 
-    // -- 历史管理 --
-
-    pub fn getHistory(self: *OaiSession) []const Message {
-        return self.history.items;
+    fn handleOaiSseEvent(ctx: *anyopaque, event: client_mod.SseEvent) anyerror!void {
+        _ = ctx;
+        _ = event;
     }
 
-    pub fn addMessage(self: *OaiSession, msg: Message) void {
-        self.history.append(msg) catch {};
-    }
-
-    pub fn clearHistory(self: *OaiSession) void {
-        for (self.history.items) |*msg| {
-            msg.deinit(self.allocator);
-        }
-        self.history.clearRetainingCapacity();
-    }
-
-    pub fn trimHistory(self: *OaiSession, max_messages: u32) void {
-        if (self.history.items.len <= max_messages) return;
-
-        const start = self.history.items.len - @as(usize, max_messages);
-        for (self.history.items[0..start]) |*msg| {
-            msg.deinit(self.allocator);
-        }
-        const remaining = self.history.items[start..];
-        std.mem.copyForwards(Message, self.history.items, remaining);
-        self.history.items.len = remaining.len;
-    }
-
-    pub fn toBaseSession(self: *OaiSession) BaseSession {
+    pub fn asBase(self: *OaiSession) BaseSession {
         return .{
-            .ptr = self,
             .vtable = &oai_vtable,
+            .data = self,
         };
     }
 };
 
-// OAI vtable 实现
-const oai_vtable = SessionVTable{
-    .name = oaiSessionName,
-    .complete = oaiSessionComplete,
-    .completeStream = oaiSessionCompleteStream,
-    .getHistory = oaiSessionGetHistory,
-    .addMessage = oaiSessionAddMessage,
-    .clearHistory = oaiSessionClearHistory,
-    .trimHistory = oaiSessionTrimHistory,
-    .deinit = oaiSessionDeinit,
+const oai_vtable = BaseSession.VTable{
+    .complete = struct {
+        fn impl(data: *anyopaque, messages: []const Message, tools: ?[]const ToolDefinition, turn: u32) anyerror!MockResponse {
+            const self: *OaiSession = @ptrCast(@alignCast(data));
+            return self.complete(messages, tools, turn);
+        }
+    }.impl,
+    .completeStream = struct {
+        fn impl(data: *anyopaque, messages: []const Message, tools: ?[]const ToolDefinition) anyerror!void {
+            const self: *OaiSession = @ptrCast(@alignCast(data));
+            return self.completeStream(messages, tools);
+        }
+    }.impl,
+    .deinit = struct {
+        fn impl(data: *anyopaque, allocator: Allocator) void {
+            const self: *OaiSession = @ptrCast(@alignCast(data));
+            self.deinit();
+            allocator.destroy(self);
+        }
+    }.impl,
 };
 
-fn oaiSessionName() []const u8 {
-    return "oai";
-}
-
-fn oaiSessionComplete(ptr: *anyopaque, messages: []const Message, tools: ?[]const ToolDefinition) anyerror!MockResponse {
-    const self: *OaiSession = @ptrCast(@alignCast(ptr));
-    return self.complete(messages, tools);
-}
-
-fn oaiSessionCompleteStream(
-    ptr: *anyopaque,
-    messages: []const Message,
-    tools: ?[]const ToolDefinition,
-    ctx: *anyopaque,
-    onEvent: *const fn (*anyopaque, SseEvent) anyerror!void,
-) anyerror!void {
-    const self: *OaiSession = @ptrCast(@alignCast(ptr));
-    return self.completeStream(messages, tools, ctx, onEvent);
-}
-
-fn oaiSessionGetHistory(ptr: *anyopaque) []const Message {
-    const self: *OaiSession = @ptrCast(@alignCast(ptr));
-    return self.getHistory();
-}
-
-fn oaiSessionAddMessage(ptr: *anyopaque, msg: Message) void {
-    const self: *OaiSession = @ptrCast(@alignCast(ptr));
-    self.addMessage(msg);
-}
-
-fn oaiSessionClearHistory(ptr: *anyopaque) void {
-    const self: *OaiSession = @ptrCast(@alignCast(ptr));
-    self.clearHistory();
-}
-
-fn oaiSessionTrimHistory(ptr: *anyopaque, max_messages: u32) void {
-    const self: *OaiSession = @ptrCast(@alignCast(ptr));
-    self.trimHistory(max_messages);
-}
-
-fn oaiSessionDeinit(ptr: *anyopaque) void {
-    const self: *OaiSession = @ptrCast(@alignCast(ptr));
-    self.deinit();
-    self.allocator.destroy(self);
-}
-
 // ---------------------------------------------------------------------------
-// resolveSession - 工厂函数
+// Factory Function
 // ---------------------------------------------------------------------------
 
-/// 根据配置创建对应的 Session 实例
-pub fn resolveSession(allocator: Allocator, config: SessionConfig) !BaseSession {
-    if (std.mem.eql(u8, config.session_type, "claude")) {
-        const session = try allocator.create(ClaudeSession);
-        session.* = try ClaudeSession.init(allocator, config);
-        return session.toBaseSession();
-    } else if (std.mem.eql(u8, config.session_type, "oai")) {
-        const session = try allocator.create(OaiSession);
-        session.* = try OaiSession.init(allocator, config);
-        return session.toBaseSession();
-    } else {
-        // 默认使用 Claude
-        const session = try allocator.create(ClaudeSession);
-        session.* = try ClaudeSession.init(allocator, config);
-        return session.toBaseSession();
-    }
-}
+/// 根据配置创建会话
+pub fn resolveSession(allocator: Allocator, config: SessionConfig) !*BaseSession {
+    const session = try allocator.create(BaseSession);
 
-// ---------------------------------------------------------------------------
-// 消息历史管理工具函数
-// ---------------------------------------------------------------------------
-
-/// 压缩消息历史：保留 system 消息 + 最近的消息
-pub fn trimMessagesHistory(
-    allocator: Allocator,
-    messages: []const Message,
-    max_messages: u32,
-) ![]const Message {
-    if (messages.len <= max_messages) {
-        return messages;
+    switch (config.api_mode) {
+        .chat_completions => {
+            const oai = try allocator.create(OaiSession);
+            oai.* = OaiSession.init(allocator, config);
+            session.* = .{
+                .vtable = &oai_vtable,
+                .data = oai,
+                .allocator = allocator,
+            };
+        },
+        .responses => {
+            const claude = try allocator.create(ClaudeSession);
+            claude.* = ClaudeSession.init(allocator, config);
+            session.* = .{
+                .vtable = &claude_vtable,
+                .data = claude,
+                .allocator = allocator,
+            };
+        },
     }
 
-    // 计算需要保留的 system 消息数量
-    var system_count: usize = 0;
-    for (messages) |msg| {
-        if (msg.role == .system) system_count += 1;
-    }
-
-    const available = @as(usize, max_messages) -| system_count;
-    const start = messages.len - available;
-
-    var result = std.ArrayList(Message).init(allocator);
-    errdefer result.deinit();
-
-    // 保留 system 消息
-    for (messages[0..system_count]) |msg| {
-        try result.append(msg);
-    }
-    // 保留最近的消息
-    for (messages[start..]) |msg| {
-        try result.append(msg);
-    }
-
-    return result.toOwnedSlice();
-}
-
-/// 计算消息历史的统计信息
-pub fn computeHistoryStats(messages: []const Message) HistoryStats {
-    var stats = HistoryStats{};
-    for (messages) |msg| {
-        stats.message_count += 1;
-        if (msg.content) |c| {
-            stats.total_chars += c.len;
-        }
-        if (msg.content_blocks) |blocks| {
-            for (blocks) |block| {
-                if (block.text) |t| {
-                    stats.total_chars += t.len;
-                }
-            }
-        }
-    }
-    // 粗略估算：4 字符 ≈ 1 token
-    stats.estimated_tokens = stats.total_chars / 4;
-    return stats;
-}
-
-/// 确保消息历史中角色交替（user/assistant）
-pub fn ensureAlternatingRoles(messages: []const Message, allocator: Allocator) ![]const Message {
-    if (messages.len <= 1) return messages;
-
-    var result = std.ArrayList(Message).init(allocator);
-    errdefer {
-        for (result.items) |*m| m.deinit(allocator);
-        result.deinit();
-    }
-
-    var last_role: ?Role = null;
-    for (messages) |msg| {
-        if (last_role) |lr| {
-            if (lr == msg.role) {
-                // 连续相同角色，跳过
-                continue;
-            }
-        }
-        try result.append(msg);
-        last_role = msg.role;
-    }
-
-    return result.toOwnedSlice();
+    return session;
 }

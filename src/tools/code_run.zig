@@ -12,7 +12,7 @@
 
 const std = @import("std");
 const registry = @import("registry.zig");
-const json = @import("json");
+const json = std.json;
 
 const ToolResult = registry.ToolResult;
 const ToolContext = registry.ToolContext;
@@ -92,7 +92,7 @@ fn runChildProcess(
 
     const term = wait_result catch {
         // 如果等待出错，尝试 kill 进程
-        child.kill() catch {};
+        _ = child.kill() catch null;
         return .{
             .exit_code = 255,
             .stdout = stdout_buf,
@@ -134,39 +134,13 @@ fn buildExecResult(
     stderr: []const u8,
     timed_out: bool,
 ) !json.Value {
-    var obj = json.Value.Object.init(allocator);
-    errdefer {
-        var it = obj.iterator();
-        while (it.next()) |e| {
-            e.value_ptr.deinit(allocator);
-            allocator.free(e.key_ptr.*);
-        }
-        obj.deinit(allocator);
-    }
+    var obj = std.json.ObjectHashMap.init(allocator);
+    errdefer obj.deinit();
 
-    // exit_code
-    {
-        const key = try allocator.dupe(u8, "exit_code");
-        try obj.put(key, .{ .int = exit_code });
-    }
-
-    // stdout
-    {
-        const key = try allocator.dupe(u8, "stdout");
-        try obj.put(key, .{ .string = stdout });
-    }
-
-    // stderr
-    {
-        const key = try allocator.dupe(u8, "stderr");
-        try obj.put(key, .{ .string = stderr });
-    }
-
-    // timed_out
-    {
-        const key = try allocator.dupe(u8, "timed_out");
-        try obj.put(key, .{ .bool = timed_out });
-    }
+    try obj.put("exit_code", .{ .integer = exit_code });
+    try obj.put("stdout", .{ .string = stdout });
+    try obj.put("stderr", .{ .string = stderr });
+    try obj.put("timed_out", .{ .bool = timed_out });
 
     return .{ .object = obj };
 }
@@ -179,14 +153,26 @@ fn buildExecResult(
 fn pythonRun(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResult {
     _ = response;
 
-    const code = args.getString("code") orelse {
+    if (args != .object) {
+        return ToolResult.errorResult(ctx.allocator, "args must be an object");
+    }
+
+    const code = blk: {
+        if (args.object.get("code")) |val| {
+            if (val == .string) break :blk val.string;
+        }
         return ToolResult.errorResult(ctx.allocator, "missing required parameter: code");
     };
 
-    const timeout: u32 = if (args.getInt("timeout")) |t|
-        if (t > 0 and t <= 600) @as(u32, @intCast(t)) else DEFAULT_TIMEOUT_SECONDS
-    else
-        DEFAULT_TIMEOUT_SECONDS;
+    const timeout: u32 = blk: {
+        if (args.object.get("timeout")) |val| {
+            if (val == .integer) {
+                const t = val.integer;
+                if (t > 0 and t <= 600) break :blk @as(u32, @intCast(t));
+            }
+        }
+        break :blk DEFAULT_TIMEOUT_SECONDS;
+    };
 
     // 构建参数：python3 -c <code>
     const python_bin = "python3";
@@ -227,14 +213,26 @@ fn pythonRun(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResu
 fn bashRun(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResult {
     _ = response;
 
-    const command = args.getString("command") orelse {
+    if (args != .object) {
+        return ToolResult.errorResult(ctx.allocator, "args must be an object");
+    }
+
+    const command = blk: {
+        if (args.object.get("command")) |val| {
+            if (val == .string) break :blk val.string;
+        }
         return ToolResult.errorResult(ctx.allocator, "missing required parameter: command");
     };
 
-    const timeout: u32 = if (args.getInt("timeout")) |t|
-        if (t > 0 and t <= 600) @as(u32, @intCast(t)) else DEFAULT_TIMEOUT_SECONDS
-    else
-        DEFAULT_TIMEOUT_SECONDS;
+    const timeout: u32 = blk: {
+        if (args.object.get("timeout")) |val| {
+            if (val == .integer) {
+                const t = val.integer;
+                if (t > 0 and t <= 600) break :blk @as(u32, @intCast(t));
+            }
+        }
+        break :blk DEFAULT_TIMEOUT_SECONDS;
+    };
 
     const shell = "/bin/bash";
     const argv = [_][]const u8{ shell, "-c", command };
@@ -274,14 +272,26 @@ fn bashRun(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResult
 fn powershellRun(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResult {
     _ = response;
 
-    const command = args.getString("command") orelse {
+    if (args != .object) {
+        return ToolResult.errorResult(ctx.allocator, "args must be an object");
+    }
+
+    const command = blk: {
+        if (args.object.get("command")) |val| {
+            if (val == .string) break :blk val.string;
+        }
         return ToolResult.errorResult(ctx.allocator, "missing required parameter: command");
     };
 
-    const timeout: u32 = if (args.getInt("timeout")) |t|
-        if (t > 0 and t <= 600) @as(u32, @intCast(t)) else DEFAULT_TIMEOUT_SECONDS
-    else
-        DEFAULT_TIMEOUT_SECONDS;
+    const timeout: u32 = blk: {
+        if (args.object.get("timeout")) |val| {
+            if (val == .integer) {
+                const t = val.integer;
+                if (t > 0 and t <= 600) break :blk @as(u32, @intCast(t));
+            }
+        }
+        break :blk DEFAULT_TIMEOUT_SECONDS;
+    };
 
     // 尝试 pwsh (PowerShell Core) 或 powershell (Windows PowerShell)
     const pwsh_bin = "pwsh";

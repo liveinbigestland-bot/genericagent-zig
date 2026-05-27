@@ -202,7 +202,7 @@ pub fn LoopCallbacks(comptime Context: type) type {
 /// 返回：LoopResult 包含退出原因和最终结果
 pub fn agentRunnerLoop(
     allocator: Allocator,
-    session: BaseSession,
+    session: *BaseSession,
     handler: *Handler,
     system_prompt: []const u8,
     user_input: []const u8,
@@ -215,7 +215,7 @@ pub fn agentRunnerLoop(
 /// 带回调的 Agent 执行循环引擎
 pub fn agentRunnerLoopWithCallbacks(
     allocator: Allocator,
-    session: BaseSession,
+    session: *BaseSession,
     handler: *Handler,
     system_prompt: []const u8,
     user_input: []const u8,
@@ -291,7 +291,7 @@ pub fn agentRunnerLoopWithCallbacks(
         // -----------------------------------------------------------
         // a. 调用 LLM 获取响应
         // -----------------------------------------------------------
-        var llm_response = session.complete(messages.items, effective_tools) catch |err| {
+        var llm_response = session.complete(messages.items, effective_tools, turn_num) catch |err| {
             std.log.err("[loop] LLM call failed at turn {d}: {}", .{ turn_num, err });
 
             // 通知回调：错误

@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const registry = @import("registry.zig");
-const json = @import("json");
+const json = std.json;
 
 const ToolResult = registry.ToolResult;
 const ToolContext = registry.ToolContext;
@@ -26,23 +26,78 @@ fn resolvePath(allocator: std.mem.Allocator, cwd: []const u8, path: []const u8) 
 }
 
 /// 构建一个简单的 JSON 对象结果
-fn buildResult(allocator: std.mem.Allocator, comptime fields: anytype) !json.Value {
-    var obj = json.Value.Object.init(allocator);
-    errdefer {
-        var it = obj.iterator();
-        while (it.next()) |e| {
-            e.value_ptr.deinit(allocator);
-            allocator.free(e.key_ptr.*);
+fn buildResultSimple(allocator: std.mem.Allocator, key: []const u8, value: []const u8) ToolResult {
+    const escaped = escapeJsonString(allocator, value) catch return ToolResult.errorResult(allocator, "failed to escape string");
+    defer allocator.free(escaped);
+    const data = ToolResult{
+        .data = .{ .text = std.fmt.allocPrint(allocator, "{{\"{s}\": \"{s}\"}}", .{ key, escaped }) catch "{\"error\": \"failed to build result\"}" },
+    };
+    return data;
+}
+
+/// 转义 JSON 字符串中的特殊字符，并过滤无效 UTF-8
+fn escapeJsonString(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    var result = std.ArrayList(u8).init(allocator);
+    errdefer result.deinit();
+
+    var i: usize = 0;
+    while (i < input.len) {
+        const c = input[i];
+
+        // 处理特殊字符
+        switch (c) {
+            '"' => try result.appendSlice("\\\""),
+            '\\' => try result.appendSlice("\\\\"),
+            '\n' => try result.appendSlice("\\n"),
+            '\r' => try result.appendSlice("\\r"),
+            '\t' => try result.appendSlice("\\t"),
+            '\x08' => try result.appendSlice("\\b"),
+            '\x0C' => try result.appendSlice("\\f"),
+            else => {
+                // 验证 UTF-8 有效性
+                if (c < 0x80) {
+                    // ASCII 字符
+                    try result.append(c);
+                    i += 1;
+                } else {
+                    // 多字节 UTF-8 字符
+                    const len: usize = if (c < 0xE0) 2 else if (c < 0xF0) 3 else if (c < 0xF8) 4 else {
+                        // 无效的 UTF-8 起始字节，跳过
+                        i += 1;
+                        continue;
+                    };
+
+                    if (i + len > input.len) {
+                        // 不完整的 UTF-8 序列，跳过
+                        i += 1;
+                        continue;
+                    }
+
+                    // 验证后续字节
+                    var valid = true;
+                    var j: usize = 1;
+                    while (j < len) : (j += 1) {
+                        if ((input[i + j] & 0xC0) != 0x80) {
+                            valid = false;
+                            break;
+                        }
+                    }
+
+                    if (valid) {
+                        try result.appendSlice(input[i .. i + len]);
+                    }
+                    i += len;
+                }
+            },
         }
-        obj.deinit(allocator);
     }
 
-    inline for (fields) |field| {
-        const key = try allocator.dupe(u8, field[0]);
-        try obj.put(key, field[1]);
-    }
+    return result.toOwnedSlice();
+}
 
-    return .{ .object = obj };
+/// 构建简单的 JSON 字符串结果
+fn buildResultStr(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![]const u8 {
+    return std.fmt.allocPrint(allocator, fmt, args);
 }
 
 /// 将文件内容按行分割，返回 ArrayList
@@ -154,7 +209,14 @@ fn findKeywordLines(
 fn fileRead(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResult {
     _ = response;
 
-    const path_arg = args.getString("path") orelse {
+    if (args != .object) {
+        return ToolResult.errorResult(ctx.allocator, "args must be an object");
+    }
+
+    const path_arg = blk: {
+        if (args.object.get("path")) |val| {
+            if (val == .string) break :blk val.string;
+        }
         return ToolResult.errorResult(ctx.allocator, "missing required parameter: path");
     };
 
@@ -167,7 +229,7 @@ fn fileRead(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResul
 
     // 打开并读取文件
     const file = std.fs.cwd().openFile(resolved, .{}) catch |err| {
-        const msg = std.fmt.allocPrint(ctx.allocator, "failed to open file '{}': {}", .{
+        const msg = std.fmt.allocPrint(ctx.allocator, "failed to open file '{s}': {}", .{
             resolved,
             err,
         }) catch "failed to open file";
@@ -208,15 +270,31 @@ fn fileRead(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResul
     const actual_content = content[0..bytes_read];
 
     // 处理 keyword 参数
-    if (args.getString("keyword")) |keyword| {
-        const context_before: u32 = if (args.getInt("context_before")) |v|
-            @as(u32, @intCast(@max(v, 0)))
-        else
-            2;
-        const context_after: u32 = if (args.getInt("context_after")) |v|
-            @as(u32, @intCast(@max(v, 0)))
-        else
-            2;
+    const keyword_opt = blk: {
+        if (args.object.get("keyword")) |kw_val| {
+            if (kw_val == .string) break :blk kw_val.string;
+        }
+        break :blk null;
+    };
+    if (keyword_opt) |keyword| {
+        const context_before: u32 = blk: {
+            if (args.object.get("context_before")) |val| {
+                if (val == .integer) {
+                    const v = val.integer;
+                    break :blk @as(u32, @intCast(@max(v, 0)));
+                }
+            }
+            break :blk 2;
+        };
+        const context_after: u32 = blk: {
+            if (args.object.get("context_after")) |val| {
+                if (val == .integer) {
+                    const v = val.integer;
+                    break :blk @as(u32, @intCast(@max(v, 0)));
+                }
+            }
+            break :blk 2;
+        };
 
         const result = findKeywordLines(actual_content, keyword, context_before, context_after) catch {
             return ToolResult.errorResult(
@@ -225,29 +303,42 @@ fn fileRead(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResul
             );
         };
 
-        const data = buildResult(ctx.allocator, .{
-            .{ "path", .{ .string = resolved } },
-            .{ "line_number", .{ .int = result.line_number } },
-            .{ "matched_line", .{ .string = result.matched_line } },
-            .{ "context", .{ .string = result.context } },
-        }) catch |err| {
-            const msg = std.fmt.allocPrint(ctx.allocator, "failed to build result: {}", .{err}) catch
-                "failed to build result";
-            return ToolResult.errorResult(ctx.allocator, msg);
+        const escaped_matched = escapeJsonString(ctx.allocator, result.matched_line) catch {
+            return ToolResult.errorResult(ctx.allocator, "failed to escape matched line");
+        };
+        defer ctx.allocator.free(escaped_matched);
+
+        const escaped_context = escapeJsonString(ctx.allocator, result.context) catch {
+            return ToolResult.errorResult(ctx.allocator, "failed to escape context");
+        };
+        defer ctx.allocator.free(escaped_context);
+
+        const result_str = std.fmt.allocPrint(ctx.allocator, "{{\"path\": \"{s}\", \"line_number\": {d}, \"matched_line\": \"{s}\", \"context\": \"{s}\"}}", .{ resolved, result.line_number, escaped_matched, escaped_context }) catch {
+            return ToolResult.errorResult(ctx.allocator, "failed to build result");
         };
 
-        return .{ .data = data };
+        return .{ .data = .{ .text = result_str } };
     }
 
     // 处理 start / count 参数（行号范围）
-    const start_line: u32 = if (args.getInt("start")) |v|
-        if (v > 0) @as(u32, @intCast(v)) else 1
-    else
-        1;
-    const count: ?u32 = if (args.getInt("count")) |v|
-        if (v > 0) @as(u32, @intCast(v)) else null
-    else
-        null;
+    const start_line: u32 = blk: {
+        if (args.object.get("start")) |val| {
+            if (val == .integer) {
+                const v = val.integer;
+                if (v > 0) break :blk @as(u32, @intCast(v));
+            }
+        }
+        break :blk 1;
+    };
+    const count: ?u32 = blk: {
+        if (args.object.get("count")) |val| {
+            if (val == .integer) {
+                const v = val.integer;
+                if (v > 0) break :blk @as(u32, @intCast(v));
+            }
+        }
+        break :blk null;
+    };
 
     if (start_line > 1 or count != null) {
         const lines = readLines(ctx.allocator, actual_content) catch {
@@ -293,39 +384,39 @@ fn fileRead(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResul
             return ToolResult.errorResult(ctx.allocator, "out of memory");
         };
 
-        const data = buildResult(ctx.allocator, .{
-            .{ "path", .{ .string = resolved } },
-            .{ "start_line", .{ .int = start_line } },
-            .{ "end_line", .{ .int = start_line + @as(u32, @intCast(end_idx - start_idx)) - 1 } },
-            .{ "total_lines", .{ .int = lines.items.len } },
-            .{ "content", .{ .string = selected_content } },
-        }) catch |err| {
+        const end_line = start_line + @as(u32, @intCast(end_idx - start_idx)) - 1;
+
+        const escaped_content = escapeJsonString(ctx.allocator, selected_content) catch {
             ctx.allocator.free(selected_content);
-            const msg = std.fmt.allocPrint(ctx.allocator, "failed to build result: {}", .{err}) catch
-                "failed to build result";
-            return ToolResult.errorResult(ctx.allocator, msg);
+            return ToolResult.errorResult(ctx.allocator, "failed to escape content");
+        };
+        defer ctx.allocator.free(escaped_content);
+
+        const result_str = std.fmt.allocPrint(ctx.allocator, "{{\"path\": \"{s}\", \"start_line\": {d}, \"end_line\": {d}, \"total_lines\": {d}, \"content\": \"{s}\"}}", .{ resolved, start_line, end_line, lines.items.len, escaped_content }) catch {
+            ctx.allocator.free(selected_content);
+            return ToolResult.errorResult(ctx.allocator, "failed to build result");
         };
 
-        return .{ .data = data };
+        ctx.allocator.free(selected_content);
+        return .{ .data = .{ .text = result_str } };
     }
 
     // 默认：返回全部内容
     const owned_content = ctx.allocator.dupe(u8, actual_content) catch {
         return ToolResult.errorResult(ctx.allocator, "out of memory");
     };
+    defer ctx.allocator.free(owned_content);
 
-    const data = buildResult(ctx.allocator, .{
-        .{ "path", .{ .string = resolved } },
-        .{ "size", .{ .int = bytes_read } },
-        .{ "content", .{ .string = owned_content } },
-    }) catch |err| {
-        ctx.allocator.free(owned_content);
-        const msg = std.fmt.allocPrint(ctx.allocator, "failed to build result: {}", .{err}) catch
-            "failed to build result";
-        return ToolResult.errorResult(ctx.allocator, msg);
+    const escaped_content = escapeJsonString(ctx.allocator, owned_content) catch {
+        return ToolResult.errorResult(ctx.allocator, "failed to escape content");
+    };
+    defer ctx.allocator.free(escaped_content);
+
+    const result_str = std.fmt.allocPrint(ctx.allocator, "{{\"path\": \"{s}\", \"size\": {d}, \"content\": \"{s}\"}}", .{ resolved, bytes_read, escaped_content }) catch {
+        return ToolResult.errorResult(ctx.allocator, "failed to build result");
     };
 
-    return .{ .data = data };
+    return .{ .data = .{ .text = result_str } };
 }
 
 // ============================================================================
@@ -335,15 +426,30 @@ fn fileRead(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResul
 fn fileWrite(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResult {
     _ = response;
 
-    const path_arg = args.getString("path") orelse {
+    if (args != .object) {
+        return ToolResult.errorResult(ctx.allocator, "args must be an object");
+    }
+
+    const path_arg = blk: {
+        if (args.object.get("path")) |val| {
+            if (val == .string) break :blk val.string;
+        }
         return ToolResult.errorResult(ctx.allocator, "missing required parameter: path");
     };
 
-    const content = args.getString("content") orelse {
+    const content = blk: {
+        if (args.object.get("content")) |val| {
+            if (val == .string) break :blk val.string;
+        }
         return ToolResult.errorResult(ctx.allocator, "missing required parameter: content");
     };
 
-    const mode = args.getString("mode") orelse "overwrite";
+    const mode = blk: {
+        if (args.object.get("mode")) |val| {
+            if (val == .string) break :blk val.string;
+        }
+        break :blk "overwrite";
+    };
 
     const resolved = resolvePath(ctx.allocator, ctx.cwd, path_arg) catch |err| {
         const msg = std.fmt.allocPrint(ctx.allocator, "failed to resolve path: {}", .{err}) catch
@@ -352,15 +458,15 @@ fn fileWrite(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResu
     };
     defer ctx.allocator.free(resolved);
 
-    const flags: std.fs.File.OpenFlags = if (std.mem.eql(u8, mode, "append"))
-        .{ .mode = .write_only }
+    const flags: std.fs.File.CreateFlags = if (std.mem.eql(u8, mode, "append"))
+        .{ .truncate = false }
     else if (std.mem.eql(u8, mode, "prepend"))
-        .{ .mode = .read_write }
+        .{ .truncate = false }
     else
-        .{ .mode = .write_only };
+        .{ .truncate = true };
 
     const file = std.fs.cwd().createFile(resolved, flags) catch |err| {
-        const msg = std.fmt.allocPrint(ctx.allocator, "failed to create/open file '{}': {}", .{
+        const msg = std.fmt.allocPrint(ctx.allocator, "failed to create/open file '{s}': {}", .{
             resolved,
             err,
         }) catch "failed to create/open file";
@@ -431,18 +537,11 @@ fn fileWrite(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResu
 
     const bytes_written = content.len;
 
-    const data = buildResult(ctx.allocator, .{
-        .{ "path", .{ .string = resolved } },
-        .{ "mode", .{ .string = mode } },
-        .{ "bytes_written", .{ .int = bytes_written } },
-        .{ "success", .{ .bool = true } },
-    }) catch |err| {
-        const msg = std.fmt.allocPrint(ctx.allocator, "failed to build result: {}", .{err}) catch
-            "failed to build result";
-        return ToolResult.errorResult(ctx.allocator, msg);
+    const result_str = std.fmt.allocPrint(ctx.allocator, "{{\"path\": \"{s}\", \"mode\": \"{s}\", \"bytes_written\": {d}, \"success\": true}}", .{ resolved, mode, bytes_written }) catch {
+        return ToolResult.errorResult(ctx.allocator, "failed to build result");
     };
 
-    return .{ .data = data };
+    return .{ .data = .{ .text = result_str } };
 }
 
 // ============================================================================
@@ -452,15 +551,28 @@ fn fileWrite(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResu
 fn filePatch(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResult {
     _ = response;
 
-    const path_arg = args.getString("path") orelse {
+    if (args != .object) {
+        return ToolResult.errorResult(ctx.allocator, "args must be an object");
+    }
+
+    const path_arg = blk: {
+        if (args.object.get("path")) |val| {
+            if (val == .string) break :blk val.string;
+        }
         return ToolResult.errorResult(ctx.allocator, "missing required parameter: path");
     };
 
-    const old_content = args.getString("old_content") orelse {
+    const old_content = blk: {
+        if (args.object.get("old_content")) |val| {
+            if (val == .string) break :blk val.string;
+        }
         return ToolResult.errorResult(ctx.allocator, "missing required parameter: old_content");
     };
 
-    const new_content = args.getString("new_content") orelse {
+    const new_content = blk: {
+        if (args.object.get("new_content")) |val| {
+            if (val == .string) break :blk val.string;
+        }
         return ToolResult.errorResult(ctx.allocator, "missing required parameter: new_content");
     };
 
@@ -473,7 +585,7 @@ fn filePatch(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResu
 
     // 读取文件全部内容
     const file = std.fs.cwd().openFile(resolved, .{ .mode = .read_write }) catch |err| {
-        const msg = std.fmt.allocPrint(ctx.allocator, "failed to open file '{}': {}", .{
+        const msg = std.fmt.allocPrint(ctx.allocator, "failed to open file '{s}': {}", .{
             resolved,
             err,
         }) catch "failed to open file";
@@ -547,26 +659,16 @@ fn filePatch(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResu
 
     // 如果新内容比旧内容短，截断文件
     if (new_size < file_size) {
-        file.setEndPos(@as(i64, @intCast(new_size))) catch {};
+        file.setEndPos(@as(u64, @intCast(new_size))) catch {};
     }
 
     ctx.allocator.free(new_buf);
 
-    const data = buildResult(ctx.allocator, .{
-        .{ "path", .{ .string = resolved } },
-        .{ "match_offset", .{ .int = idx } },
-        .{ "old_length", .{ .int = old_content.len } },
-        .{ "new_length", .{ .int = new_content.len } },
-        .{ "original_size", .{ .int = bytes_read } },
-        .{ "new_size", .{ .int = new_size } },
-        .{ "success", .{ .bool = true } },
-    }) catch |err| {
-        const msg = std.fmt.allocPrint(ctx.allocator, "failed to build result: {}", .{err}) catch
-            "failed to build result";
-        return ToolResult.errorResult(ctx.allocator, msg);
+    const result_str = std.fmt.allocPrint(ctx.allocator, "{{\"path\": \"{s}\", \"match_offset\": {d}, \"old_length\": {d}, \"new_length\": {d}, \"original_size\": {d}, \"new_size\": {d}, \"success\": true}}", .{ resolved, idx, old_content.len, new_content.len, bytes_read, new_size }) catch {
+        return ToolResult.errorResult(ctx.allocator, "failed to build result");
     };
 
-    return .{ .data = data };
+    return .{ .data = .{ .text = result_str } };
 }
 
 // ============================================================================

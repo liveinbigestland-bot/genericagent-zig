@@ -6,6 +6,8 @@ pub const Config = struct {
     model: []const u8,
     session_type: []const u8,
     language: []const u8,
+    enable_logging: bool = false,
+    log_dir: []const u8 = "logs",
 
     pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         const content = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
@@ -22,6 +24,8 @@ pub const Config = struct {
             .model = try allocator.dupe(u8, parsed.value.model),
             .session_type = try allocator.dupe(u8, parsed.value.session_type),
             .language = try allocator.dupe(u8, parsed.value.language),
+            .enable_logging = parsed.value.enable_logging,
+            .log_dir = try allocator.dupe(u8, parsed.value.log_dir),
         };
     }
 
@@ -31,6 +35,7 @@ pub const Config = struct {
         allocator.free(self.model);
         allocator.free(self.session_type);
         allocator.free(self.language);
+        allocator.free(self.log_dir);
     }
 };
 

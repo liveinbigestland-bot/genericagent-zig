@@ -100,7 +100,7 @@ pub const Agent = struct {
     /// Agent 配置
     config: AgentConfig,
     /// LLM 会话
-    session: ?llm_session.BaseSession,
+    session: ?*llm_session.BaseSession,
     /// 工具处理器
     handler: Handler,
     /// 系统提示词
@@ -136,7 +136,7 @@ pub const Agent = struct {
                 "   - 参数：{\"message\": \"退出消息\"}（可选）\n\n" ++
                 "请根据用户的需求，合理使用工具来完成任务。如果用户询问记忆相关的内容，请使用 working_memory_get 工具查询。";
 
-        const handler = Handler.init(allocator, .{
+        const handler = try Handler.init(allocator, .{
             .cwd = config.cwd,
             .max_turns = config.max_turns,
             .global_memory = config.global_memory,
@@ -166,8 +166,8 @@ pub const Agent = struct {
 
     /// 销毁 Agent，释放所有资源
     pub fn deinit(self: *Agent) void {
-        // 销毁 session
-        if (self.session) |*s| {
+        // 销毁 session（BaseSession.deinit() 会自行释放内存）
+        if (self.session) |s| {
             s.deinit();
         }
 
@@ -197,8 +197,9 @@ pub const Agent = struct {
     /// 也可以通过此方法替换现有的会话。
     pub fn initSession(self: *Agent, config: llm_session.SessionConfig) !void {
         // 销毁旧会话
-        if (self.session) |*s| {
+        if (self.session) |s| {
             s.deinit();
+            self.allocator.destroy(s);
             self.session = null;
         }
 
@@ -208,9 +209,10 @@ pub const Agent = struct {
     }
 
     /// 设置外部会话（用于测试或自定义会话）
-    pub fn setSession(self: *Agent, session: llm_session.BaseSession) void {
-        if (self.session) |*s| {
+    pub fn setSession(self: *Agent, session: *llm_session.BaseSession) void {
+        if (self.session) |s| {
             s.deinit();
+            self.allocator.destroy(s);
         }
         self.session = session;
     }
@@ -302,8 +304,6 @@ pub const Agent = struct {
         // 确保会话已初始化
         try self.ensureSession();
 
-        const session = self.session.?;
-
         // 获取任务或使用直接输入
         const task = if (user_input != null)
             Task{ .user_input = user_input.? }
@@ -326,7 +326,7 @@ pub const Agent = struct {
         // 调用循环引擎
         const result = loop.agentRunnerLoop(
             self.allocator,
-            session,
+            self.session.?,
             &self.handler,
             effective_system_prompt,
             task.user_input,

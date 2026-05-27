@@ -131,6 +131,25 @@ pub const Message = struct {
 // ToolCall / ToolResult
 // ---------------------------------------------------------------------------
 
+fn freeJsonValue(value: *json.Value, allocator: Allocator) void {
+    switch (value.*) {
+        .string => |s| allocator.free(s),
+        .array => |*arr| {
+            for (arr.items) |*item| freeJsonValue(item, allocator);
+            allocator.free(arr.items);
+        },
+        .object => |*obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                freeJsonValue(entry.value_ptr, allocator);
+            }
+            obj.deinit();
+        },
+        else => {},
+    }
+}
+
 /// 工具调用
 pub const ToolCall = struct {
     id: []const u8,
@@ -140,6 +159,7 @@ pub const ToolCall = struct {
     pub fn deinit(self: *ToolCall, allocator: Allocator) void {
         allocator.free(self.id);
         allocator.free(self.name);
+        freeJsonValue(&self.arguments, allocator);
     }
 };
 

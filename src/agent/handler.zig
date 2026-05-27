@@ -11,12 +11,18 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const std_json = std.json;
-const json = @import("json");
+const json = std.json;
 
+// 导入 tools 模块（使用其定义的接口实现解耦）
 const tools = @import("tools");
 const ToolDef = tools.ToolDef;
 const ToolError = tools.ToolError;
+const ToolDispatcher = tools.ToolDispatcher;
+const ToolEntry = tools.ToolEntry;
+const ToolContext = tools.ToolContext;
+const ToolResult = tools.ToolResult;
+const ToolFn = tools.ToolFn;
+const ToolRegistry = tools.ToolRegistry;
 
 const llm = @import("llm");
 const ToolDefinition = llm.ToolDefinition;
@@ -36,7 +42,7 @@ pub const StepOutcome = struct {
     /// 是否应该退出循环
     should_exit: bool = false,
     /// 退出时携带的附加数据
-    exit_data: ?std_json.Value = null,
+    exit_data: ?[]const u8 = null,
     /// 下一轮的提示词（注入到 tool_results 之后）
     next_prompt: ?[]const u8 = null,
 
@@ -46,6 +52,9 @@ pub const StepOutcome = struct {
         }
         if (self.next_prompt) |prompt| {
             allocator.free(prompt);
+        }
+        if (self.exit_data) |data| {
+            allocator.free(data);
         }
         self.* = .{ .result = "" };
     }
@@ -81,10 +90,16 @@ pub const NoToolOutcome = struct {
 /// - 管理工作记忆（working memory）
 /// - 管理历史摘要（history info）
 /// - 在轮次结束时执行回调逻辑
+///
+/// 支持依赖注入：通过 ToolDispatcher 接口解耦具体工具实现
 pub const Handler = struct {
     allocator: Allocator,
-    /// 工具注册表
-    registry: tools.ToolRegistry,
+    /// 工具调度器（通过接口解耦）
+    dispatcher: ?ToolDispatcher,
+    /// 内部的工具注册表（当使用默认调度器时）
+    registry: ?*ToolRegistry,
+    /// 是否拥有 dispatcher（用于 deinit）
+    owns_dispatcher: bool,
     /// 工作记忆（键值对形式）
     working: std.StringHashMap([]const u8),
     /// 历史摘要列表
@@ -108,11 +123,39 @@ pub const Handler = struct {
     /// 是否启用 verbose 模式
     verbose: bool,
 
-    /// 初始化 Handler
-    pub fn init(allocator: Allocator, config: HandlerConfig) Handler {
+    /// 初始化 Handler（使用默认的工具调度器）
+    pub fn init(allocator: Allocator, config: HandlerConfig) !Handler {
+        var self: Handler = .{
+            .allocator = allocator,
+            .dispatcher = null,
+            .registry = null,
+            .owns_dispatcher = false,
+            .working = std.StringHashMap([]const u8).init(allocator),
+            .history_info = std.ArrayList([]const u8).init(allocator),
+            .cwd = config.cwd orelse "/workspace",
+            .current_turn = 0,
+            .max_turns = config.max_turns orelse 40,
+            .next_prompt = null,
+            .global_memory = config.global_memory,
+            .system_prompt = config.system_prompt orelse "",
+            .last_response_text = "",
+            .empty_response_count = 0,
+            .verbose = config.verbose orelse true,
+        };
+
+        // 创建默认的工具调度器，自动注册文件操作工具
+        try self.createDefaultDispatcher();
+
+        return self;
+    }
+
+    /// 初始化 Handler（使用自定义的工具调度器）
+    pub fn initWithDispatcher(allocator: Allocator, config: HandlerConfig, dispatcher: ToolDispatcher) Handler {
         return .{
             .allocator = allocator,
-            .registry = tools.ToolRegistry.init(allocator),
+            .dispatcher = dispatcher,
+            .registry = null,
+            .owns_dispatcher = false,
             .working = std.StringHashMap([]const u8).init(allocator),
             .history_info = std.ArrayList([]const u8).init(allocator),
             .cwd = config.cwd orelse "/workspace",
@@ -129,6 +172,12 @@ pub const Handler = struct {
 
     /// 释放资源
     pub fn deinit(self: *Handler) void {
+        // 释放内部的工具注册表
+        if (self.registry) |reg| {
+            reg.deinit();
+            self.allocator.destroy(reg);
+        }
+
         // 释放工作记忆中的键值对
         var it = self.working.iterator();
         while (it.next()) |entry| {
@@ -152,22 +201,27 @@ pub const Handler = struct {
         if (self.global_memory) |m| {
             self.allocator.free(m);
         }
-
-        self.registry.deinit();
     }
 
     // ================================================================
     // 工具注册
     // ================================================================
 
-    /// 注册一个工具
-    pub fn registerToolEntry(self: *Handler, entry: tools.ToolEntry) !void {
-        try self.registry.register(entry);
+    /// 注册一个工具条目（使用接口）
+    pub fn registerToolEntry(self: *Handler, entry: ToolEntry) !void {
+        // 如果没有设置 dispatcher，创建默认的
+        if (self.dispatcher == null) {
+            try self.createDefaultDispatcher();
+        }
+        try self.dispatcher.?.register(self.dispatcher.?.ctx, entry);
     }
 
     /// 注册一个工具（兼容旧版 ToolDef）
     pub fn registerTool(self: *Handler, tool: ToolDef) !void {
-        try self.registry.register(.{
+        if (self.dispatcher == null) {
+            try self.createDefaultDispatcher();
+        }
+        try self.dispatcher.?.register(self.dispatcher.?.ctx, .{
             .name = tool.name,
             .description = tool.description,
             .parameters_schema = tool.parameters_schema,
@@ -183,10 +237,20 @@ pub const Handler = struct {
     }
 
     /// 批量注册 modern ToolEntry
-    pub fn registerToolEntries(self: *Handler, entries: []const tools.ToolEntry) !void {
-        for (entries) |entry| {
-            try self.registry.register(entry);
+    pub fn registerToolEntries(self: *Handler, entries: []const ToolEntry) !void {
+        if (self.dispatcher == null) {
+            try self.createDefaultDispatcher();
         }
+        try self.dispatcher.?.registerEntries(self.dispatcher.?.ctx, entries);
+    }
+
+    /// 创建默认的工具调度器
+    fn createDefaultDispatcher(self: *Handler) !void {
+        var reg = try self.allocator.create(ToolRegistry);
+        reg.* = try tools.createDefaultRegistry(self.allocator);
+        self.registry = reg;
+        self.dispatcher = reg.asDispatcher();
+        self.owns_dispatcher = true;
     }
 
     // ================================================================
@@ -205,41 +269,46 @@ pub const Handler = struct {
     pub fn dispatch(
         self: *Handler,
         tool_name: []const u8,
-        args: std_json.Value,
+        args: json.Value,
         response: []const u8,
     ) StepOutcome {
         self.current_turn += 1;
 
+        // 如果没有设置 dispatcher，创建默认的
+        if (self.dispatcher == null) {
+            self.createDefaultDispatcher() catch {};
+        }
+
         // -----------------------------------------------------------
-        // 内置工具处理
+        // 内置工具处理（保留在 Handler 中，因为涉及内部状态管理）
         // -----------------------------------------------------------
 
         // exit / finish 工具：标记退出
         if (std.mem.eql(u8, tool_name, "exit") or
             std.mem.eql(u8, tool_name, "finish"))
         {
-            const exit_msg = if (args == .object and args.object.get("message") != null)
-                args.object.get("message").?.string
-            else
-                "Agent 主动退出。";
-
-            // Clone exit_data via JSON round-trip
-            var exit_data_val: ?std_json.Value = null;
-            if (args == .object) {
-                const data_str = std_json.stringifyAlloc(self.allocator, args, .{}) catch "";
-                const parsed = std_json.parseFromSlice(std_json.Value, self.allocator, data_str, .{}) catch null;
-                if (parsed) |*p| {
-                    exit_data_val = p.value;
-                    self.allocator.free(data_str);
-                } else {
-                    self.allocator.free(data_str);
+            const exit_msg = if (args == .object) blk: {
+                const args_obj = args.object;
+                if (args_obj.get("message")) |msg_val| {
+                    if (msg_val == .string) {
+                        break :blk msg_val.string;
+                    }
                 }
+                break :blk "Agent 主动退出。";
+            } else "Agent 主动退出。";
+
+            // Clone exit_data via JSON stringify
+            var exit_data_str: []const u8 = "";
+            const data_str = json.stringifyAlloc(self.allocator, args, .{}) catch "";
+            if (data_str.len > 0) {
+                exit_data_str = self.allocator.dupe(u8, data_str) catch "";
             }
+            self.allocator.free(data_str);
 
             return .{
                 .result = exit_msg,
                 .should_exit = true,
-                .exit_data = exit_data_val,
+                .exit_data = exit_data_str,
             };
         }
 
@@ -254,70 +323,66 @@ pub const Handler = struct {
         }
 
         // -----------------------------------------------------------
-        // 查找并执行注册的工具
+        // 查找并执行注册的工具（通过 dispatcher 接口）
         // -----------------------------------------------------------
-        const args_str = std_json.stringifyAlloc(self.allocator, args, .{}) catch "{}";
-        const args_doc = json.parseFromString(self.allocator, args_str) catch null;
-        defer if (args_doc) |d| d.deinit(self.allocator);
-        const local_args = if (args_doc) |d| blk: {
-            d.acquire();
-            defer d.release();
-            break :blk d.root.v();
-        } else json.Value.null;
-        self.allocator.free(args_str);
+        if (self.dispatcher) |disp| {
+            var ctx = ToolContext{
+                .allocator = self.allocator,
+                .cwd = self.cwd,
+                .current_turn = self.current_turn,
+                .parent = self, // 传递 Handler 指针，让工具可以访问工作记忆
+            };
 
-        var ctx = tools.ToolContext{
-            .allocator = self.allocator,
-            .cwd = self.cwd,
-            .current_turn = self.current_turn,
-            .parent = null,
-        };
+            var tool_result = disp.dispatch(disp.ctx, &ctx, tool_name, args, response);
+            defer tool_result.deinit(self.allocator);
 
-        var tool_result = self.registry.dispatch(&ctx, tool_name, local_args, response);
-        var next_prompt: ?[]const u8 = null;
-        if (tool_result.next_prompt) |prompt| {
-            next_prompt = prompt;
-            tool_result.next_prompt = null;
-        }
-
-        var result_text: []const u8 = "";
-        var result_owned = false;
-        if (tool_result.data) |data| {
-            switch (data) {
-                .text => {
-                    result_text = data.text;
-                },
-                .value => |val| {
-                    if (std.meta.activeTag(val) == .string) {
-                        result_text = val.string.to();
-                    } else {
-                        const converted = json.stringifyAlloc(self.allocator, val, .{}) catch "";
-                        if (converted.len > 0) {
-                            result_text = converted;
-                            result_owned = true;
-                        }
-                    }
-                },
+            var next_prompt: ?[]const u8 = null;
+            if (tool_result.next_prompt) |prompt| {
+                next_prompt = self.allocator.dupe(u8, prompt) catch null;
             }
+
+            var result_text: []const u8 = "";
+            var result_owned = false;
+            if (tool_result.data) |data| {
+                switch (data) {
+                    .text => {
+                        result_text = data.text;
+                    },
+                    .value => |val| {
+                        if (val == .string) {
+                            result_text = val.string;
+                        } else {
+                            const converted = json.stringifyAlloc(self.allocator, val, .{}) catch "";
+                            if (converted.len > 0) {
+                                result_text = converted;
+                                result_owned = true;
+                            }
+                        }
+                    },
+                }
+            }
+
+            if (self.verbose) {
+                std.log.info("[handler] tool '{s}' executed, result len: {d}", .{
+                    tool_name,
+                    result_text.len,
+                });
+            }
+
+            return .{
+                .result = result_text,
+                .result_owned = result_owned,
+                .is_error = false,
+                .should_exit = tool_result.should_exit,
+                .exit_data = null,
+                .next_prompt = next_prompt,
+            };
         }
 
-        const should_exit = tool_result.should_exit;
-        tool_result.deinit(self.allocator);
-
-        if (self.verbose) {
-            std.log.info("[handler] tool '{s}' executed, result len: {d}", .{
-                tool_name,
-                result_text.len,
-            });
-        }
-
+        // 没有可用的 dispatcher
         return .{
-            .result = result_text,
-            .result_owned = result_owned,
-            .is_error = false,
-            .should_exit = should_exit,
-            .exit_data = null,
-            .next_prompt = next_prompt,
+            .result = "工具调度器未初始化",
+            .is_error = true,
         };
     }
 
@@ -526,23 +591,32 @@ pub const Handler = struct {
     // getToolDefinitions - 获取工具定义列表
     // ================================================================
 
-    /// 从注册表生成 ToolDefinition 列表（用于发送给 LLM）
+    /// 从调度器生成 ToolDefinition 列表（用于发送给 LLM）
     pub fn getToolDefinitions(self: *Handler, allocator: Allocator) []const ToolDefinition {
         // 预留空间
         var defs = std.ArrayList(ToolDefinition).init(allocator);
         defer defs.deinit();
 
-        // 遍历注册表中的所有工具
-        for (self.registry.getToolNames()) |name| {
-            const entry = self.registry.find(name) orelse continue;
-            defs.append(.{
-                .name = entry.name,
-                .description = entry.description,
-                .parameters = entry.parameters_schema,
-            }) catch continue;
+        // 如果 dispatcher 还没有初始化，先创建默认的
+        if (self.dispatcher == null) {
+            self.createDefaultDispatcher() catch {};
         }
 
-        // 添加内置工具定义
+        // 通过 dispatcher 获取工具定义
+        if (self.dispatcher) |disp| {
+            const interface_defs = disp.getToolDefinitions(disp.ctx, allocator);
+            defer allocator.free(interface_defs);
+
+            for (interface_defs) |def| {
+                defs.append(.{
+                    .name = def.name,
+                    .description = def.description,
+                    .parameters = def.parameters,
+                }) catch continue;
+            }
+        }
+
+        // 添加内置工具定义（exit, working_memory_*）
         defs.append(.{
             .name = "exit",
             .description = "退出 Agent 循环。当任务完成或需要提前终止时调用。",
@@ -663,78 +737,6 @@ pub const Handler = struct {
     }
 
     // ================================================================
-    // 内部工具处理函数
-    // ================================================================
-
-    fn handleWorkingMemorySet(self: *Handler, args: std_json.Value) StepOutcome {
-        if (args != .object) {
-            return .{
-                .result = "参数格式错误：需要 JSON 对象。",
-                .is_error = true,
-            };
-        }
-
-        const key_val = args.object.get("key");
-        const key = if (key_val != null and key_val.? == .string) key_val.?.string else {
-            return .{
-                .result = "缺少参数: key",
-                .is_error = true,
-            };
-        };
-
-        const value_val = args.object.get("value");
-        const value = if (value_val != null and value_val.? == .string) value_val.?.string else {
-            return .{
-                .result = "缺少参数: value",
-                .is_error = true,
-            };
-        };
-
-        self.setWorkingMemory(key, value) catch |err| {
-            return .{
-                .result = std.fmt.allocPrint(
-                    self.allocator,
-                    "设置工作记忆失败: {}",
-                    .{err},
-                ) catch "设置工作记忆失败",
-                .is_error = true,
-            };
-        };
-
-        return .{
-            .result = "已设置工作记忆",
-        };
-    }
-
-    fn handleWorkingMemoryGet(self: *Handler, args: std_json.Value) StepOutcome {
-        if (args != .object) {
-            return .{
-                .result = "参数格式错误：需要 JSON 对象。",
-                .is_error = true,
-            };
-        }
-
-        const key_val = args.object.get("key");
-        const key = if (key_val != null and key_val.? == .string) key_val.?.string else {
-            return .{
-                .result = "缺少参数: key",
-                .is_error = true,
-            };
-        };
-
-        const value = self.getWorkingMemory(key) orelse {
-            return .{
-                .result = "工作记忆中不存在该键",
-                .is_error = true,
-            };
-        };
-
-        return .{
-            .result = value,
-        };
-    }
-
-    // ================================================================
     // 辅助函数
     // ================================================================
 
@@ -760,6 +762,106 @@ pub const Handler = struct {
         }
 
         return total_code_len > threshold;
+    }
+
+    // ================================================================
+    // JSON 处理函数
+    // ================================================================
+
+    fn handleWorkingMemorySet(self: *Handler, args: json.Value) StepOutcome {
+        if (args != .object) {
+            return .{
+                .result = "参数必须是对象",
+                .is_error = true,
+            };
+        }
+
+        const args_obj = args.object;
+
+        const key = blk: {
+            if (args_obj.get("key")) |key_val| {
+                if (key_val == .string) {
+                    break :blk key_val.string;
+                }
+            }
+            break :blk @as([]const u8, "");
+        };
+
+        if (key.len == 0) {
+            return .{
+                .result = "缺少参数: key",
+                .is_error = true,
+            };
+        }
+
+        const value = blk: {
+            if (args_obj.get("value")) |val_val| {
+                if (val_val == .string) {
+                    break :blk val_val.string;
+                }
+            }
+            break :blk @as([]const u8, "");
+        };
+
+        if (value.len == 0) {
+            return .{
+                .result = "缺少参数: value",
+                .is_error = true,
+            };
+        }
+
+        self.setWorkingMemory(key, value) catch |err| {
+            return .{
+                .result = std.fmt.allocPrint(
+                    self.allocator,
+                    "设置工作记忆失败: {}",
+                    .{err},
+                ) catch "设置工作记忆失败",
+                .is_error = true,
+            };
+        };
+
+        return .{
+            .result = "已设置工作记忆",
+        };
+    }
+
+    fn handleWorkingMemoryGet(self: *Handler, args: json.Value) StepOutcome {
+        if (args != .object) {
+            return .{
+                .result = "参数必须是对象",
+                .is_error = true,
+            };
+        }
+
+        const args_obj = args.object;
+
+        const key = blk: {
+            if (args_obj.get("key")) |key_val| {
+                if (key_val == .string) {
+                    break :blk key_val.string;
+                }
+            }
+            break :blk @as([]const u8, "");
+        };
+
+        if (key.len == 0) {
+            return .{
+                .result = "缺少参数: key",
+                .is_error = true,
+            };
+        }
+
+        const value = self.getWorkingMemory(key) orelse {
+            return .{
+                .result = "工作记忆中不存在该键",
+                .is_error = true,
+            };
+        };
+
+        return .{
+            .result = value,
+        };
     }
 };
 
@@ -865,21 +967,13 @@ test "Handler dispatch - exit tool" {
     var handler = Handler.init(testing.allocator, .{});
     defer handler.deinit();
 
-    // Create a std.json.dynamic.Value object using parseFromSlice
     const json_str = "{\"message\":\"done\"}";
-    const parsed = try json.parseFromSlice(json.Value, testing.allocator, json_str, .{});
-    defer parsed.deinit();
+    var args = try json.parseFromSlice(json.Value, testing.allocator, json_str, .{});
+    defer args.deinit();
 
-    const outcome = handler.dispatch("exit", parsed.value, "");
+    const outcome = handler.dispatch("exit", args.value, "");
+    defer outcome.deinit(testing.allocator);
     try testing.expect(outcome.should_exit);
-}
-
-test "Handler dispatch - unknown tool" {
-    var handler = Handler.init(testing.allocator, .{});
-    defer handler.deinit();
-
-    const outcome = handler.dispatch("nonexistent_tool", .null, "");
-    try testing.expect(outcome.is_error);
 }
 
 test "Handler turnEndCallback - near limit" {

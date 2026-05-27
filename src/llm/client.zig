@@ -17,6 +17,12 @@ const json = std.json;
 
 /// HTTP 客户端配置
 pub const ClientConfig = struct {
+    /// API 基础 URL
+    base_url: []const u8 = "",
+    /// API 密钥
+    api_key: []const u8 = "",
+    /// 超时时间（毫秒）
+    timeout_ms: u32 = 60000,
     /// 最大重试次数（默认 3）
     max_retries: u32 = 3,
     /// 基础延迟（毫秒，默认 1000）
@@ -38,6 +44,7 @@ pub const RequestHeaders = struct {
     authorization: ?[]const u8 = null,
     content_type: []const u8 = "application/json",
     accept: []const u8 = "application/json",
+    api_key: []const u8 = "",
     /// 额外自定义头
     extra: ?[]const HeaderEntry = null,
 
@@ -230,6 +237,11 @@ pub const LlmClient = struct {
                 return LlmError.AllocationFailed;
         }
 
+        if (headers.api_key.len > 0) {
+            extra_headers_list.append(.{ .name = "X-API-Key", .value = headers.api_key }) catch
+                return LlmError.AllocationFailed;
+        }
+
         if (headers.extra) |extras| {
             for (extras) |entry| {
                 extra_headers_list.append(.{ .name = entry.name, .value = entry.value }) catch
@@ -343,6 +355,11 @@ pub const LlmClient = struct {
 
         if (headers.authorization) |auth| {
             extra_headers_list.append(.{ .name = "Authorization", .value = auth }) catch
+                return LlmError.AllocationFailed;
+        }
+
+        if (headers.api_key.len > 0) {
+            extra_headers_list.append(.{ .name = "X-API-Key", .value = headers.api_key }) catch
                 return LlmError.AllocationFailed;
         }
 

@@ -12,7 +12,7 @@
 
 const std = @import("std");
 const registry = @import("registry.zig");
-const json = @import("json");
+const json = std.json;
 
 const ToolResult = registry.ToolResult;
 const ToolContext = registry.ToolContext;
@@ -39,7 +39,8 @@ fn httpGet(allocator: std.mem.Allocator, host: []const u8, port: u16, path: []co
 
     // 发送请求
     var request_buf: [4096]u8 = undefined;
-    const request = try std.fmt.bufPrint(&request_buf,
+    const request = try std.fmt.bufPrint(
+        &request_buf,
         "GET {s} HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n\r\n",
         .{ path, host, port },
     );
@@ -89,7 +90,8 @@ fn httpPost(
 
     // 发送请求
     var header_buf: [4096]u8 = undefined;
-    const header = try std.fmt.bufPrint(&header_buf,
+    const header = try std.fmt.bufPrint(
+        &header_buf,
         "POST {s} HTTP/1.1\r\nHost: {s}:{d}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
         .{ path, host, port, content_type, body.len },
     );
@@ -257,13 +259,28 @@ fn getPageInfo(allocator: std.mem.Allocator, host: []const u8, port: u16) !json.
 fn webScan(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResult {
     _ = response;
 
-    const host = args.getString("host") orelse DEFAULT_CDP_HOST;
-    const port: u16 = if (args.getInt("port")) |p|
-        if (p > 0 and p <= 65535) @as(u16, @intCast(p)) else DEFAULT_CDP_PORT
-    else
-        DEFAULT_CDP_PORT;
+    const host = blk: {
+        if (args == .object and args.object.get("host")) |val| {
+            if (val == .string) break :blk val.string;
+        }
+        break :blk DEFAULT_CDP_HOST;
+    };
+    const port: u16 = blk: {
+        if (args == .object and args.object.get("port")) |val| {
+            if (val == .integer) {
+                const p = val.integer;
+                if (p > 0 and p <= 65535) break :blk @as(u16, @intCast(p));
+            }
+        }
+        break :blk DEFAULT_CDP_PORT;
+    };
 
-    const url = args.getString("url");
+    const url = blk: {
+        if (args == .object and args.object.get("url")) |val| {
+            if (val == .string) break :blk val.string;
+        }
+        break :blk null;
+    };
 
     // 如果指定了 url，尝试导航到该页面（通过 CDP 的 Page.navigate）
     // 注意：完整实现需要 WebSocket，这里先获取标签页信息
@@ -292,15 +309,32 @@ fn webScan(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResult
 fn webExecuteJs(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResult {
     _ = response;
 
-    const script = args.getString("script") orelse {
+    if (args != .object) {
+        return ToolResult.errorResult(ctx.allocator, "args must be an object");
+    }
+
+    const script = blk: {
+        if (args.object.get("script")) |val| {
+            if (val == .string) break :blk val.string;
+        }
         return ToolResult.errorResult(ctx.allocator, "missing required parameter: script");
     };
 
-    const host = args.getString("host") orelse DEFAULT_CDP_HOST;
-    const port: u16 = if (args.getInt("port")) |p|
-        if (p > 0 and p <= 65535) @as(u16, @intCast(p)) else DEFAULT_CDP_PORT
-    else
-        DEFAULT_CDP_PORT;
+    const host = blk: {
+        if (args.object.get("host")) |val| {
+            if (val == .string) break :blk val.string;
+        }
+        break :blk DEFAULT_CDP_HOST;
+    };
+    const port: u16 = blk: {
+        if (args.object.get("port")) |val| {
+            if (val == .integer) {
+                const p = val.integer;
+                if (p > 0 and p <= 65535) break :blk @as(u16, @intCast(p));
+            }
+        }
+        break :blk DEFAULT_CDP_PORT;
+    };
 
     // 尝试通过 CDP 执行 JavaScript
     const result = cdpEvaluate(ctx.allocator, host, port, script) catch |err| {

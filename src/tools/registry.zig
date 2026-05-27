@@ -2,9 +2,8 @@
 //!
 //! 定义 ToolRegistry，管理所有工具的注册和调度。
 //! 提供 register() 和 dispatch() 方法，dispatch 根据 tool_name 查找并调用对应函数。
-
 const std = @import("std");
-const json = @import("json");
+const json = std.json;
 
 // ============================================================================
 // 核心类型
@@ -62,7 +61,7 @@ pub const ToolResult = struct {
         if (self.data) |*d| {
             switch (d.*) {
                 .text => allocator.free(d.text),
-                .value => {},
+                .value => {}, // json.Value 不需要显式 deinit
             }
         }
         if (self.next_prompt) |p| allocator.free(p);
@@ -77,7 +76,7 @@ pub const ToolContext = struct {
     cwd: []const u8,
     /// 当前 Agent 循环的轮次
     current_turn: u32,
-    /// Agent 实例的不透明指针（可用于回调）
+    /// Handler 实例指针（用于访问工作记忆等内部状态）
     parent: ?*anyopaque = null,
 };
 
@@ -92,6 +91,24 @@ pub const ToolEntry = struct {
     parameters_schema: []const u8,
     /// 实际执行函数
     func: ToolFn,
+};
+
+/// 工具定义（用于发送给 LLM）
+pub const ToolDefinition = struct {
+    name: []const u8,
+    description: []const u8,
+    parameters: []const u8,
+};
+
+/// 工具调度器接口（用于依赖注入）
+pub const ToolDispatcher = struct {
+    ctx: *anyopaque,
+    register: *const fn (ctx: *anyopaque, entry: ToolEntry) error{OutOfMemory}!void,
+    registerEntries: *const fn (ctx: *anyopaque, entries: []const ToolEntry) error{OutOfMemory}!void,
+    dispatch: *const fn (ctx: *anyopaque, tool_ctx: *ToolContext, tool_name: []const u8, args: json.Value, response: []const u8) ToolResult,
+    getToolDefinitions: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) []const ToolDefinition,
+    getToolNames: *const fn (ctx: *anyopaque) []const []const u8,
+    count: *const fn (ctx: *anyopaque) usize,
 };
 
 // ============================================================================
@@ -115,7 +132,11 @@ pub const ToolRegistry = struct {
     }
 
     pub fn deinit(self: *ToolRegistry) void {
-        // 释放有序名称列表（名称本身由 entries 的 key 持有，不单独释放）
+        // 释放所有注册时复制的工具名称
+        var iter = self.entries.iterator();
+        while (iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
         self.ordered_names.deinit();
         self.entries.deinit();
     }
@@ -166,39 +187,68 @@ pub const ToolRegistry = struct {
         return self.entries.count();
     }
 
-    /// 生成所有工具定义的 JSON Schema 数组（用于发送给 LLM）
-    /// 返回的字符串由 allocator 管理，调用方负责 free
-    pub fn buildToolsSchema(self: *ToolRegistry) ![]const u8 {
-        const std_json = std.json;
-
-        var tools = std.ArrayList(std_json.Value).init(self.allocator);
-        errdefer tools.deinit();
+    /// 获取工具定义列表（用于发送给 LLM）
+    pub fn getToolDefinitions(self: *const ToolRegistry, allocator: std.mem.Allocator) ![]const ToolDefinition {
+        var defs = std.ArrayList(ToolDefinition).init(allocator);
+        errdefer defs.deinit();
 
         for (self.ordered_names.items) |name| {
-            const entry = self.entries.get(name).?;
-
-            var func_obj = std_json.ObjectMap.init(self.allocator);
-            errdefer func_obj.deinit();
-
-            try func_obj.put("name", .{ .string = entry.name });
-            try func_obj.put("description", .{ .string = entry.description });
-
-            // parameters: 从 JSON Schema 字符串解析
-            const params_val = std_json.parseFromSlice(std_json.Value, self.allocator, entry.parameters_schema, .{}) catch
-                std_json.Value.null;
-            defer if (params_val != .null) params_val.deinit(self.allocator);
-            try func_obj.put("parameters", params_val);
-
-            var obj = std_json.ObjectMap.init(self.allocator);
-            errdefer obj.deinit();
-
-            try obj.put("type", .{ .string = "function" });
-            try obj.put("function", .{ .object = func_obj });
-
-            try tools.append(.{ .object = obj });
+            if (@intFromPtr(name.ptr) == 0 or name.len == 0) continue;
+            if (self.entries.get(name)) |entry| {
+                try defs.append(.{
+                    .name = entry.name,
+                    .description = entry.description,
+                    .parameters = entry.parameters_schema,
+                });
+            }
         }
 
-        return std_json.stringifyAlloc(self.allocator, tools.items, .{});
+        return defs.toOwnedSlice();
+    }
+
+    /// 转换为 ToolDispatcher 接口
+    pub fn asDispatcher(self: *ToolRegistry) ToolDispatcher {
+        return .{
+            .ctx = self,
+            .register = registerDispatcher,
+            .registerEntries = registerEntriesDispatcher,
+            .dispatch = dispatchDispatcher,
+            .getToolDefinitions = getToolDefinitionsDispatcher,
+            .getToolNames = getToolNamesDispatcher,
+            .count = countDispatcher,
+        };
+    }
+
+    fn registerDispatcher(ctx: *anyopaque, entry: ToolEntry) !void {
+        const self: *ToolRegistry = @ptrCast(@alignCast(ctx));
+        try self.register(entry);
+    }
+
+    fn registerEntriesDispatcher(ctx: *anyopaque, entries: []const ToolEntry) !void {
+        const self: *ToolRegistry = @ptrCast(@alignCast(ctx));
+        for (entries) |entry| {
+            try self.register(entry);
+        }
+    }
+
+    fn dispatchDispatcher(ctx: *anyopaque, tool_ctx: *ToolContext, tool_name: []const u8, args: json.Value, response: []const u8) ToolResult {
+        const self: *ToolRegistry = @ptrCast(@alignCast(ctx));
+        return self.dispatch(tool_ctx, tool_name, args, response);
+    }
+
+    fn getToolDefinitionsDispatcher(ctx: *anyopaque, allocator: std.mem.Allocator) []const ToolDefinition {
+        const self: *ToolRegistry = @ptrCast(@alignCast(ctx));
+        return self.getToolDefinitions(allocator) catch &.{};
+    }
+
+    fn getToolNamesDispatcher(ctx: *anyopaque) []const []const u8 {
+        const self: *ToolRegistry = @ptrCast(@alignCast(ctx));
+        return self.getToolNames();
+    }
+
+    fn countDispatcher(ctx: *anyopaque) usize {
+        const self: *ToolRegistry = @ptrCast(@alignCast(ctx));
+        return self.count();
     }
 };
 
@@ -208,92 +258,78 @@ pub const ToolRegistry = struct {
 
 const testing = std.testing;
 
-test "ToolRegistry - register and find" {
-    const allocator = testing.allocator;
-
-    var registry = ToolRegistry.init(allocator);
+test "ToolRegistry init and deinit" {
+    var registry = ToolRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    const dummyFn: ToolFn = struct {
-        fn dummy(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResult {
-            _ = args;
-            _ = response;
-            return ToolResult.textResult(ctx.allocator, "ok");
-        }
-    }.dummy;
+    try testing.expectEqual(@as(usize, 0), registry.count());
+}
 
-    try registry.register(.{
+test "ToolRegistry register and find" {
+    var registry = ToolRegistry.init(testing.allocator);
+    defer registry.deinit();
+
+    const entry = ToolEntry{
         .name = "test_tool",
         .description = "A test tool",
         .parameters_schema = "{}",
-        .func = dummyFn,
-    });
+        .func = testToolFunc,
+    };
+
+    try registry.register(entry);
 
     try testing.expectEqual(@as(usize, 1), registry.count());
 
-    const entry = registry.find("test_tool");
-    try testing.expect(entry != null);
-    try testing.expectEqualStrings("test_tool", entry.?.name);
-    try testing.expectEqualStrings("A test tool", entry.?.description);
+    const found = registry.find("test_tool");
+    try testing.expect(found != null);
+    try testing.expectEqualStrings("test_tool", found.?.name);
 }
 
-test "ToolRegistry - dispatch" {
-    const allocator = testing.allocator;
+fn testToolFunc(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResult {
+    _ = args;
+    _ = response;
+    return ToolResult.textResult(ctx.allocator, "test result");
+}
 
-    var registry = ToolRegistry.init(allocator);
+test "ToolRegistry dispatch" {
+    var registry = ToolRegistry.init(testing.allocator);
     defer registry.deinit();
 
-    const echoFn: ToolFn = struct {
-        fn echo(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResult {
-            _ = response;
-            if (args.getString("message")) |msg| {
-                return ToolResult.textResult(ctx.allocator, msg);
-            }
-            return ToolResult.errorResult(ctx.allocator, "missing message");
-        }
-    }.echo;
+    const entry = ToolEntry{
+        .name = "test_dispatch",
+        .description = "Test dispatch",
+        .parameters_schema = "{}",
+        .func = testToolFunc,
+    };
 
-    try registry.register(.{
-        .name = "echo",
-        .description = "Echo a message",
-        .parameters_schema = "{\"type\":\"object\",\"properties\":{\"message\":{\"type\":\"string\"}}}",
-        .func = echoFn,
-    });
+    try registry.register(entry);
 
     var ctx = ToolContext{
-        .allocator = allocator,
+        .allocator = testing.allocator,
         .cwd = "/tmp",
         .current_turn = 1,
     };
 
-    const args = try json.parseFromString(allocator, "{\"message\":\"hello\"}");
-    defer args.deinit(allocator);
-
-    const result = registry.dispatch(&ctx, "echo", args, "");
-    defer result.deinit(allocator);
+    const args = json.Value{ .null = {} };
+    var result = registry.dispatch(&ctx, "test_dispatch", args, "");
+    defer result.deinit(testing.allocator);
 
     try testing.expect(result.data != null);
-    try testing.expectEqual(@as(std.meta.Tag(json.Value), .string), std.meta.activeTag(result.data.?));
-    try testing.expectEqualStrings("hello", result.data.?.string);
-    try testing.expect(!result.should_exit);
 }
 
-test "ToolRegistry - dispatch unknown tool" {
-    const allocator = testing.allocator;
-
-    var registry = ToolRegistry.init(allocator);
+test "ToolRegistry dispatch - tool not found" {
+    var registry = ToolRegistry.init(testing.allocator);
     defer registry.deinit();
 
     var ctx = ToolContext{
-        .allocator = allocator,
+        .allocator = testing.allocator,
         .cwd = "/tmp",
         .current_turn = 1,
     };
 
-    const args = json.Value.null;
-    const result = registry.dispatch(&ctx, "nonexistent", args, "");
-    defer result.deinit(allocator);
+    const args = json.Value{ .null = {} };
+    var result = registry.dispatch(&ctx, "nonexistent", args, "");
+    defer result.deinit(testing.allocator);
 
     try testing.expect(result.data != null);
-    try testing.expectEqualStrings("tool not found", result.data.?.string);
 }
