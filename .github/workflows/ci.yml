@@ -32,7 +32,21 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Build project
+      - name: Build project (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          echo "=== Building project ==="
+          zig build 2>&1 | Tee-Object -FilePath build.log
+          $BUILD_EXIT_CODE = $LASTEXITCODE
+          echo "Build exit code: $BUILD_EXIT_CODE"
+          if ($BUILD_EXIT_CODE -ne 0) {
+            echo "::error::Build failed with exit code $BUILD_EXIT_CODE"
+          }
+          exit $BUILD_EXIT_CODE
+
+      - name: Build project (Unix)
+        if: matrix.os != 'windows-latest'
         shell: bash
         run: |
           echo "=== Building project ==="
@@ -53,7 +67,21 @@ jobs:
           path: build.log
           retention-days: 30
 
-      - name: Run all unit tests
+      - name: Run all unit tests (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          echo "=== Running all unit tests ==="
+          zig build test-all 2>&1 | Tee-Object -FilePath test.log
+          $TEST_EXIT_CODE = $LASTEXITCODE
+          echo "Test exit code: $TEST_EXIT_CODE"
+          if ($TEST_EXIT_CODE -ne 0) {
+            echo "::error::Tests failed with exit code $TEST_EXIT_CODE"
+          }
+          exit $TEST_EXIT_CODE
+
+      - name: Run all unit tests (Unix)
+        if: matrix.os != 'windows-latest'
         shell: bash
         run: |
           echo "=== Running all unit tests ==="
