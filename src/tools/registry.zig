@@ -25,15 +25,29 @@ pub const ToolResult = struct {
     };
 
     /// 创建一个仅包含文本数据的简单结果
-    pub fn textResult(_: std.mem.Allocator, text: []const u8) ToolResult {
+    pub fn textResult(allocator: std.mem.Allocator, text: []const u8) ToolResult {
+        const owned_text = allocator.dupe(u8, text) catch {
+            return .{ .data = .{ .text = "" }, .should_exit = false };
+        };
         return .{
-            .data = .{ .text = text },
+            .data = .{ .text = owned_text },
             .should_exit = false,
         };
     }
 
     /// 创建一个错误结果
-    pub fn errorResult(_: std.mem.Allocator, err_msg: []const u8) ToolResult {
+    pub fn errorResult(allocator: std.mem.Allocator, err_msg: []const u8) ToolResult {
+        const owned_msg = allocator.dupe(u8, err_msg) catch {
+            return .{ .data = .{ .text = "unknown error" }, .should_exit = false };
+        };
+        return .{
+            .data = .{ .text = owned_msg },
+            .should_exit = false,
+        };
+    }
+
+    /// 创建一个错误结果（直接接管已分配的字符串，不重复复制）
+    pub fn errorResultOwned(err_msg: []const u8) ToolResult {
         return .{
             .data = .{ .text = err_msg },
             .should_exit = false,
@@ -41,9 +55,12 @@ pub const ToolResult = struct {
     }
 
     /// 创建一个要求退出的结果
-    pub fn exitResult(_: std.mem.Allocator, text: []const u8) ToolResult {
+    pub fn exitResult(allocator: std.mem.Allocator, text: []const u8) ToolResult {
+        const owned_text = allocator.dupe(u8, text) catch {
+            return .{ .data = .{ .text = "" }, .should_exit = true };
+        };
         return .{
-            .data = .{ .text = text },
+            .data = .{ .text = owned_text },
             .should_exit = true,
         };
     }
@@ -60,11 +77,20 @@ pub const ToolResult = struct {
     pub fn deinit(self: *ToolResult, allocator: std.mem.Allocator) void {
         if (self.data) |*d| {
             switch (d.*) {
-                .text => allocator.free(d.text),
+                .text => {
+                    // 只释放非空且长度大于0的字符串
+                    if (d.text.len > 0) {
+                        allocator.free(d.text);
+                    }
+                },
                 .value => {}, // json.Value 不需要显式 deinit
             }
         }
-        if (self.next_prompt) |p| allocator.free(p);
+        if (self.next_prompt) |p| {
+            if (p.len > 0) {
+                allocator.free(p);
+            }
+        }
         self.* = .{};
     }
 };
@@ -139,6 +165,9 @@ pub const ToolRegistry = struct {
         }
         self.ordered_names.deinit();
         self.entries.deinit();
+        // 重置为初始状态以支持多次 deinit
+        self.entries = std.StringHashMap(ToolEntry).init(self.allocator);
+        self.ordered_names = std.ArrayList([]const u8).init(self.allocator);
     }
 
     /// 注册一个工具。name 会被复制到 allocator 管理的内存中。

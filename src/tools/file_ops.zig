@@ -41,7 +41,7 @@ fn escapeJsonString(allocator: std.mem.Allocator, input: []const u8) ![]const u8
     errdefer result.deinit();
 
     var i: usize = 0;
-    while (i < input.len) {
+    while (i < input.len) : (i += 1) {
         const c = input[i];
 
         // 处理特殊字符
@@ -58,18 +58,15 @@ fn escapeJsonString(allocator: std.mem.Allocator, input: []const u8) ![]const u8
                 if (c < 0x80) {
                     // ASCII 字符
                     try result.append(c);
-                    i += 1;
                 } else {
                     // 多字节 UTF-8 字符
                     const len: usize = if (c < 0xE0) 2 else if (c < 0xF0) 3 else if (c < 0xF8) 4 else {
                         // 无效的 UTF-8 起始字节，跳过
-                        i += 1;
                         continue;
                     };
 
                     if (i + len > input.len) {
                         // 不完整的 UTF-8 序列，跳过
-                        i += 1;
                         continue;
                     }
 
@@ -85,8 +82,8 @@ fn escapeJsonString(allocator: std.mem.Allocator, input: []const u8) ![]const u8
 
                     if (valid) {
                         try result.appendSlice(input[i .. i + len]);
+                        i += len - 1; // 主循环会 +1，所以这里只需要 +len-1
                     }
-                    i += len;
                 }
             },
         }
@@ -223,7 +220,11 @@ fn fileRead(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResul
     const resolved = resolvePath(ctx.allocator, ctx.cwd, path_arg) catch |err| {
         const msg = std.fmt.allocPrint(ctx.allocator, "failed to resolve path: {}", .{err}) catch
             "failed to resolve path";
-        return ToolResult.errorResult(ctx.allocator, msg);
+        if (std.mem.eql(u8, msg, "failed to resolve path")) {
+            return ToolResult.errorResult(ctx.allocator, msg);
+        } else {
+            return ToolResult.errorResultOwned(msg);
+        }
     };
     defer ctx.allocator.free(resolved);
 
@@ -233,14 +234,22 @@ fn fileRead(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResul
             resolved,
             err,
         }) catch "failed to open file";
-        return ToolResult.errorResult(ctx.allocator, msg);
+        if (std.mem.eql(u8, msg, "failed to open file")) {
+            return ToolResult.errorResult(ctx.allocator, msg);
+        } else {
+            return ToolResult.errorResultOwned(msg);
+        }
     };
     defer file.close();
 
     const stat = file.stat() catch |err| {
         const msg = std.fmt.allocPrint(ctx.allocator, "failed to stat file: {}", .{err}) catch
             "failed to stat file";
-        return ToolResult.errorResult(ctx.allocator, msg);
+        if (std.mem.eql(u8, msg, "failed to stat file")) {
+            return ToolResult.errorResult(ctx.allocator, msg);
+        } else {
+            return ToolResult.errorResultOwned(msg);
+        }
     };
 
     const file_size = @as(usize, @intCast(stat.size));
@@ -252,20 +261,32 @@ fn fileRead(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResul
             "file too large ({} bytes, max {} bytes)",
             .{ file_size, max_read_size },
         ) catch "file too large";
-        return ToolResult.errorResult(ctx.allocator, msg);
+        if (std.mem.eql(u8, msg, "file too large")) {
+            return ToolResult.errorResult(ctx.allocator, msg);
+        } else {
+            return ToolResult.errorResultOwned(msg);
+        }
     }
 
     const content = ctx.allocator.alloc(u8, file_size) catch |err| {
         const msg = std.fmt.allocPrint(ctx.allocator, "out of memory: {}", .{err}) catch
             "out of memory";
-        return ToolResult.errorResult(ctx.allocator, msg);
+        if (std.mem.eql(u8, msg, "out of memory")) {
+            return ToolResult.errorResult(ctx.allocator, msg);
+        } else {
+            return ToolResult.errorResultOwned(msg);
+        }
     };
     defer ctx.allocator.free(content);
 
     const bytes_read = file.readAll(content) catch |err| {
         const msg = std.fmt.allocPrint(ctx.allocator, "failed to read file: {}", .{err}) catch
             "failed to read file";
-        return ToolResult.errorResult(ctx.allocator, msg);
+        if (std.mem.eql(u8, msg, "failed to read file")) {
+            return ToolResult.errorResult(ctx.allocator, msg);
+        } else {
+            return ToolResult.errorResultOwned(msg);
+        }
     };
     const actual_content = content[0..bytes_read];
 
@@ -459,11 +480,11 @@ fn fileWrite(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResu
     defer ctx.allocator.free(resolved);
 
     const flags: std.fs.File.CreateFlags = if (std.mem.eql(u8, mode, "append"))
-        .{ .truncate = false }
+        .{ .truncate = false, .read = false }
     else if (std.mem.eql(u8, mode, "prepend"))
-        .{ .truncate = false }
+        .{ .truncate = false, .read = true }
     else
-        .{ .truncate = true };
+        .{ .truncate = true, .read = false };
 
     const file = std.fs.cwd().createFile(resolved, flags) catch |err| {
         const msg = std.fmt.allocPrint(ctx.allocator, "failed to create/open file '{s}': {}", .{
@@ -676,10 +697,7 @@ fn filePatch(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResu
 // ============================================================================
 
 /// file_read 工具定义
-pub const file_read: ToolEntry = .{
-    .name = "file_read",
-    .description = "Read file content. Supports reading by line range (start/count) or searching by keyword. Returns file path, content, and metadata.",
-    .parameters_schema =
+pub const file_read: ToolEntry = .{ .name = "file_read", .description = "Read file content. Supports reading by line range (start/count) or searching by keyword. Returns file path, content, and metadata.", .parameters_schema = 
     \\{
     \\  "type": "object",
     \\  "properties": {
@@ -710,9 +728,7 @@ pub const file_read: ToolEntry = .{
     \\  },
     \\  "required": ["path"]
     \\}
-    ,
-    .func = fileRead,
-};
+, .func = &fileRead };
 
 /// file_write 工具定义
 pub const file_write: ToolEntry = .{
@@ -740,7 +756,7 @@ pub const file_write: ToolEntry = .{
     \\  "required": ["path", "content"]
     \\}
     ,
-    .func = fileWrite,
+    .func = &fileWrite,
 };
 
 /// file_patch 工具定义
@@ -767,7 +783,7 @@ pub const file_patch: ToolEntry = .{
     \\  "required": ["path", "old_content", "new_content"]
     \\}
     ,
-    .func = filePatch,
+    .func = &filePatch,
 };
 
 /// 获取所有文件操作工具的注册条目列表

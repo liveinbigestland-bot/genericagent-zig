@@ -113,11 +113,11 @@ pub fn createDefaultRegistry(allocator: std.mem.Allocator) !ToolRegistry {
     var reg = ToolRegistry.init(allocator);
     errdefer reg.deinit();
 
-    // 暂时注释掉代码执行工具（可能导致编译器崩溃）
-    // const code_entries = code_run.getToolEntries();
-    // for (code_entries) |entry| {
-    //     try reg.register(entry);
-    // }
+    // 启用 code_run 工具（3 个）
+    const code_entries = code_run.getToolEntries();
+    for (code_entries) |entry| {
+        try reg.register(entry);
+    }
 
     // 注册文件操作工具（3 个）
     const file_entries = file_ops.getToolEntries();
@@ -125,16 +125,17 @@ pub fn createDefaultRegistry(allocator: std.mem.Allocator) !ToolRegistry {
         try reg.register(entry);
     }
 
-    // 暂时注释掉其他工具
-    // const web_entries = web_ops.getToolEntries();
-    // for (web_entries) |entry| {
-    //     try reg.register(entry);
-    // }
+    // 启用 web_ops 工具（2 个）
+    const web_entries = web_ops.getToolEntries();
+    for (web_entries) |entry| {
+        try reg.register(entry);
+    }
 
-    // const memory_entries = memory_ops.getToolEntries();
-    // for (memory_entries) |entry| {
-    //     try reg.register(entry);
-    // }
+    // 启用 memory_ops 工具（3 个）
+    const memory_entries = memory_ops.getToolEntries();
+    for (memory_entries) |entry| {
+        try reg.register(entry);
+    }
 
     return reg;
 }

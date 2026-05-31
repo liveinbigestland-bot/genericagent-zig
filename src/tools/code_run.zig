@@ -41,9 +41,8 @@ fn runChildProcess(
     stderr: []const u8,
     timed_out: bool,
 } {
-    // TODO: 实现基于 timeout_seconds 的超时控制
     _ = timeout_seconds;
-    const max_output_size: usize = 10 * 1024 * 1024; // 10MB 上限
+    const max_output_size: usize = 10 * 1024 * 1024;
 
     var child = std.process.Child.init(argv, allocator);
     child.cwd = cwd;
@@ -55,51 +54,36 @@ fn runChildProcess(
         child.stdin_behavior = .Ignore;
     }
 
-    // 启动子进程
     try child.spawn();
 
-    // 如果有输入，写入 stdin 然后关闭
     if (input) |inp| {
-        const stdin_writer = child.stdin.?;
-        try stdin_writer.writeAll(inp);
-        stdin_writer.close();
+        if (child.stdin) |stdin| {
+            try stdin.writeAll(inp);
+            stdin.close();
+        }
     }
 
-    // 创建线程来读取 stdout 和 stderr
-    const stdout_thread = try std.Thread.spawn(.{}, readThread, .{
-        child.stdout.?,
-        max_output_size,
-    });
-    const stderr_thread = try std.Thread.spawn(.{}, readThread, .{
-        child.stderr.?,
-        max_output_size,
-    });
+    var stdout_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer stderr_buf.deinit(allocator);
 
-    // 等待进程结束或超时
-    const timed_out = false;
+    try child.collectOutput(allocator, &stdout_buf, &stderr_buf, max_output_size);
 
-    // 尝试等待进程结束
-    const wait_result = child.wait();
-    // 注意：Zig 0.13.0 中 wait() 是阻塞的，超时需要用 kill
-    // 我们先 join 线程，然后检查是否超时
-
-    stdout_thread.join();
-    stderr_thread.join();
-
-    // 获取输出
-    const stdout_buf = child.stdout.?.reader().readAllAlloc(allocator, max_output_size) catch "";
-    const stderr_buf = child.stderr.?.reader().readAllAlloc(allocator, max_output_size) catch "";
-
-    const term = wait_result catch {
-        // 如果等待出错，尝试 kill 进程
+    const term = child.wait() catch {
         _ = child.kill() catch null;
+        const stdout_owned = try allocator.dupe(u8, stdout_buf.items);
+        const stderr_owned = try allocator.dupe(u8, stderr_buf.items);
         return .{
             .exit_code = 255,
-            .stdout = stdout_buf,
-            .stderr = stderr_buf,
+            .stdout = stdout_owned,
+            .stderr = stderr_owned,
             .timed_out = true,
         };
     };
+
+    const stdout_owned = try allocator.dupe(u8, stdout_buf.items);
+    const stderr_owned = try allocator.dupe(u8, stderr_buf.items);
 
     const exit_code: u8 = switch (term) {
         .Exited => |code| if (code >= 0 and code <= 255) @as(u8, @intCast(code)) else 255,
@@ -108,41 +92,45 @@ fn runChildProcess(
 
     return .{
         .exit_code = exit_code,
-        .stdout = stdout_buf,
-        .stderr = stderr_buf,
-        .timed_out = timed_out,
+        .stdout = stdout_owned,
+        .stderr = stderr_owned,
+        .timed_out = false,
     };
 }
 
-/// 线程函数：持续从文件描述符读取数据（消耗管道缓冲区）
-fn readThread(file: std.fs.File, max_size: usize) void {
-    var buf: [4096]u8 = undefined;
-    var total: usize = 0;
-    const reader = file.reader();
-    while (total < max_size) {
-        const n = reader.read(&buf) catch break;
-        if (n == 0) break;
-        total += n;
-    }
-}
-
-/// 构建执行结果 JSON 对象
+/// 构建执行结果 JSON 字符串
 fn buildExecResult(
     allocator: std.mem.Allocator,
     exit_code: u8,
     stdout: []const u8,
     stderr: []const u8,
     timed_out: bool,
-) !json.Value {
-    var obj = std.json.ObjectHashMap.init(allocator);
-    errdefer obj.deinit();
+) ![]u8 {
+    const escaped_stdout = try escapeJsonString(allocator, stdout);
+    defer allocator.free(escaped_stdout);
 
-    try obj.put("exit_code", .{ .integer = exit_code });
-    try obj.put("stdout", .{ .string = stdout });
-    try obj.put("stderr", .{ .string = stderr });
-    try obj.put("timed_out", .{ .bool = timed_out });
+    const escaped_stderr = try escapeJsonString(allocator, stderr);
+    defer allocator.free(escaped_stderr);
 
-    return .{ .object = obj };
+    return std.fmt.allocPrint(allocator, "{{\"exit_code\":{},\"stdout\":\"{s}\",\"stderr\":\"{s}\",\"timed_out\":{}}}", .{ exit_code, escaped_stdout, escaped_stderr, timed_out });
+}
+
+fn escapeJsonString(allocator: std.mem.Allocator, str: []const u8) ![]u8 {
+    var result = std.ArrayList(u8).init(allocator);
+    defer result.deinit();
+
+    for (str) |c| {
+        switch (c) {
+            '\\' => try result.appendSlice("\\\\"),
+            '"' => try result.appendSlice("\\\""),
+            '\n' => try result.appendSlice("\\n"),
+            '\r' => try result.appendSlice("\\r"),
+            '\t' => try result.appendSlice("\\t"),
+            else => try result.append(c),
+        }
+    }
+
+    return result.toOwnedSlice();
 }
 
 // ============================================================================
@@ -174,8 +162,9 @@ fn pythonRun(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResu
         break :blk DEFAULT_TIMEOUT_SECONDS;
     };
 
-    // 构建参数：python3 -c <code>
-    const python_bin = "python3";
+    // 构建参数：python -c <code>
+    // 在 Windows 上使用 python，在 Unix 上可能是 python3
+    const python_bin = if (@import("builtin").os.tag == .windows) "python" else "python3";
     const argv = [_][]const u8{ python_bin, "-c", code };
 
     const result = runChildProcess(
@@ -185,10 +174,13 @@ fn pythonRun(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResu
         timeout,
         null,
     ) catch |err| {
-        const msg = std.fmt.allocPrint(ctx.allocator, "failed to execute python3: {}", .{err}) catch
-            "failed to execute python3";
-        return ToolResult.errorResult(ctx.allocator, msg);
+        const msg = std.fmt.allocPrint(ctx.allocator, "failed to execute python3: {}", .{err}) catch return ToolResult.errorResult(ctx.allocator, "failed to execute python3");
+        return ToolResult.errorResultOwned(msg);
     };
+    defer {
+        ctx.allocator.free(result.stdout);
+        ctx.allocator.free(result.stderr);
+    }
 
     const data = buildExecResult(
         ctx.allocator,
@@ -197,12 +189,11 @@ fn pythonRun(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResu
         result.stderr,
         result.timed_out,
     ) catch |err| {
-        const msg = std.fmt.allocPrint(ctx.allocator, "failed to build result: {}", .{err}) catch
-            "failed to build result";
-        return ToolResult.errorResult(ctx.allocator, msg);
+        const msg = std.fmt.allocPrint(ctx.allocator, "failed to build result: {}", .{err}) catch return ToolResult.errorResult(ctx.allocator, "failed to build result");
+        return ToolResult.errorResultOwned(msg);
     };
 
-    return .{ .data = data };
+    return .{ .data = .{ .text = data } };
 }
 
 // ============================================================================
@@ -244,10 +235,13 @@ fn bashRun(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResult
         timeout,
         null,
     ) catch |err| {
-        const msg = std.fmt.allocPrint(ctx.allocator, "failed to execute bash: {}", .{err}) catch
-            "failed to execute bash";
-        return ToolResult.errorResult(ctx.allocator, msg);
+        const msg = std.fmt.allocPrint(ctx.allocator, "failed to execute bash: {}", .{err}) catch return ToolResult.errorResult(ctx.allocator, "failed to execute bash");
+        return ToolResult.errorResultOwned(msg);
     };
+    defer {
+        ctx.allocator.free(result.stdout);
+        ctx.allocator.free(result.stderr);
+    }
 
     const data = buildExecResult(
         ctx.allocator,
@@ -256,12 +250,11 @@ fn bashRun(ctx: *ToolContext, args: json.Value, response: []const u8) ToolResult
         result.stderr,
         result.timed_out,
     ) catch |err| {
-        const msg = std.fmt.allocPrint(ctx.allocator, "failed to build result: {}", .{err}) catch
-            "failed to build result";
-        return ToolResult.errorResult(ctx.allocator, msg);
+        const msg = std.fmt.allocPrint(ctx.allocator, "failed to build result: {}", .{err}) catch return ToolResult.errorResult(ctx.allocator, "failed to build result");
+        return ToolResult.errorResultOwned(msg);
     };
 
-    return .{ .data = data };
+    return .{ .data = .{ .text = data } };
 }
 
 // ============================================================================
@@ -309,9 +302,13 @@ fn powershellRun(ctx: *ToolContext, args: json.Value, response: []const u8) Tool
             ctx.allocator,
             "failed to execute powershell (pwsh): {}. Ensure PowerShell Core is installed.",
             .{err},
-        ) catch "failed to execute powershell";
-        return ToolResult.errorResult(ctx.allocator, msg);
+        ) catch return ToolResult.errorResult(ctx.allocator, "failed to execute powershell");
+        return ToolResult.errorResultOwned(msg);
     };
+    defer {
+        ctx.allocator.free(result.stdout);
+        ctx.allocator.free(result.stderr);
+    }
 
     const data = buildExecResult(
         ctx.allocator,
@@ -320,12 +317,11 @@ fn powershellRun(ctx: *ToolContext, args: json.Value, response: []const u8) Tool
         result.stderr,
         result.timed_out,
     ) catch |err| {
-        const msg = std.fmt.allocPrint(ctx.allocator, "failed to build result: {}", .{err}) catch
-            "failed to build result";
-        return ToolResult.errorResult(ctx.allocator, msg);
+        const msg = std.fmt.allocPrint(ctx.allocator, "failed to build result: {}", .{err}) catch return ToolResult.errorResult(ctx.allocator, "failed to build result");
+        return ToolResult.errorResultOwned(msg);
     };
 
-    return .{ .data = data };
+    return .{ .data = .{ .text = data } };
 }
 
 // ============================================================================
