@@ -33,21 +33,23 @@ jobs:
           python-version: '3.x'
 
       - name: Build project
-        run: zig build
-
-      - name: Run unit tests (excluding web_ops which require network)
         run: |
-          echo "Running code_run tests..."
-          zig build test-code-run --summary all
-          echo "Running file_ops tests..."
-          zig build test-file-ops --summary all
-          echo "Running memory_ops tests..."
-          zig build test-memory-ops --summary all
-          echo "Running tools tests..."
-          zig build test-tools --summary all
+          echo "=== Building project ==="
+          zig build 2>&1
+          BUILD_EXIT_CODE=$?
+          echo "Build exit code: $BUILD_EXIT_CODE"
+          if [ $BUILD_EXIT_CODE -ne 0 ]; then
+            echo "Build failed with exit code $BUILD_EXIT_CODE"
+            exit $BUILD_EXIT_CODE
+          fi
 
-      - name: Run web_ops tests
-        run: zig build test-web-ops --summary all
+      - name: Run all unit tests
+        run: |
+          echo "=== Running all unit tests ==="
+          zig build test-all --summary all 2>&1
+          TEST_EXIT_CODE=$?
+          echo "Test exit code: $TEST_EXIT_CODE"
+          exit $TEST_EXIT_CODE
 
   lint:
     runs-on: ubuntu-latest
