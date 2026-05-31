@@ -35,8 +35,13 @@ jobs:
       - name: Build project
         run: zig build
 
-      - name: Run all unit tests
-        run: zig build test-all --summary all
+      - name: Run all unit tests (verbose)
+        run: zig build test-all --summary all 2>&1 || true
+
+      - name: Check test results
+        run: |
+          echo "Checking test output..."
+          zig build test-all --summary all
 
   lint:
     runs-on: ubuntu-latest
