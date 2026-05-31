@@ -32,20 +32,25 @@ jobs:
         with:
           python-version: '3.x'
 
+      - name: Check Zig version
+        run: zig version
+
+      - name: Check Python version
+        run: python --version
+
       - name: Build project
         run: zig build
+
+      - name: Run simple test first
+        run: |
+          echo "Running simple test..."
+          zig test tests/tools_test.zig 2>&1 || echo "Simple test completed"
 
       - name: Run all unit tests
         shell: bash
         run: |
-          echo "Running tests..."
+          echo "Running all tests..."
           zig build test-all --summary all 2>&1
-          exit_code=$?
-          echo "Test exit code: $exit_code"
-          if [ $exit_code -ne 0 ]; then
-            echo "Tests failed, but continuing to show output"
-          fi
-          exit $exit_code
 
   lint:
     runs-on: ubuntu-latest
