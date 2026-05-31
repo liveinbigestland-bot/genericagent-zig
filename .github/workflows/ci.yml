@@ -27,6 +27,11 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
       - name: Build project
         run: zig build
 
