@@ -24,7 +24,7 @@ const ToolEntry = registry.ToolEntry;
 
 const DEFAULT_CDP_HOST = "127.0.0.1";
 const DEFAULT_CDP_PORT: u16 = 9222;
-const HTTP_TIMEOUT_MS: u32 = 10000;
+const HTTP_TIMEOUT_MS: u32 = 2000;
 
 // ============================================================================
 // 内部辅助：简单 HTTP GET（不使用 std.http，直接 TCP socket）
