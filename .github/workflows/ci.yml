@@ -17,7 +17,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -32,29 +32,22 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Check Zig version
-        run: zig version
-
-      - name: Check Python version
-        run: python --version
+      - name: Verify environments
+        run: |
+          echo "=== Environment Info ==="
+          zig version
+          python --version
+          echo "======================="
 
       - name: Build project
         run: zig build
 
-      - name: Run simple test first
-        run: |
-          echo "Running simple test..."
-          zig test tests/tools_test.zig 2>&1 || echo "Simple test completed"
-
       - name: Run all unit tests
-        shell: bash
-        run: |
-          echo "Running all tests..."
-          zig build test-all --summary all 2>&1
+        run: zig build test-all --summary all
 
   lint:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
