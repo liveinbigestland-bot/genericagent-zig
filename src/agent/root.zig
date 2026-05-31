@@ -323,25 +323,35 @@ pub const Agent = struct {
         else
             self.system_prompt;
 
-        // 调用循环引擎
-        const result = loop.agentRunnerLoop(
+        // 获取现有历史
+        const history = if (self.history.items.len > 0) self.history.items else null;
+
+        // 调用循环引擎（带历史）
+        const result = loop.agentRunnerLoopWithHistory(
             self.allocator,
             self.session.?,
             &self.handler,
             effective_system_prompt,
             task.user_input,
             self.config,
+            history,
         ) catch |err| {
             std.log.err("[agent] loop failed: {}", .{err});
             return AgentError.LlmError;
         };
 
-        // 保存最终响应到历史
+        // 更新历史：添加用户输入和助手响应
+        // 添加用户输入
+        self.history.append(.{
+            .role = .user,
+            .content = try self.allocator.dupe(u8, task.user_input),
+        }) catch {};
+
+        // 添加助手响应
         if (result.response) |resp| {
-            // 添加 assistant 消息
             self.history.append(.{
                 .role = .assistant,
-                .content = self.allocator.dupe(u8, resp) catch null,
+                .content = try self.allocator.dupe(u8, resp),
             }) catch {};
         }
 

@@ -8,6 +8,25 @@ pub const Config = struct {
     language: []const u8,
     enable_logging: bool = false,
     log_dir: []const u8 = "logs",
+    log_level: []const u8 = "info",
+
+    // Agent 循环配置
+    max_turns: u32 = 40,
+    verbose: bool = true,
+
+    // Token 优化配置
+    enable_sliding_window: bool = true,
+    max_history_messages: u32 = 20,
+    max_tool_result_length: u32 = 2000,
+
+    // 动态工具选择配置
+    enable_dynamic_tools: bool = true,
+    max_dynamic_tools: u32 = 10,
+
+    // 代理配置
+    proxy_host: ?[]const u8 = null,
+    proxy_port: ?u16 = null,
+    proxy_type: []const u8 = "http",
 
     pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         const content = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
@@ -26,6 +45,14 @@ pub const Config = struct {
             .language = try allocator.dupe(u8, parsed.value.language),
             .enable_logging = parsed.value.enable_logging,
             .log_dir = try allocator.dupe(u8, parsed.value.log_dir),
+            .log_level = try allocator.dupe(u8, parsed.value.log_level),
+            .max_turns = parsed.value.max_turns,
+            .verbose = parsed.value.verbose,
+            .enable_sliding_window = parsed.value.enable_sliding_window,
+            .max_history_messages = parsed.value.max_history_messages,
+            .max_tool_result_length = parsed.value.max_tool_result_length,
+            .enable_dynamic_tools = parsed.value.enable_dynamic_tools,
+            .max_dynamic_tools = parsed.value.max_dynamic_tools,
         };
     }
 
@@ -36,6 +63,7 @@ pub const Config = struct {
         allocator.free(self.session_type);
         allocator.free(self.language);
         allocator.free(self.log_dir);
+        allocator.free(self.log_level);
     }
 };
 

@@ -122,6 +122,14 @@ pub const Handler = struct {
     empty_response_count: u32,
     /// 是否启用 verbose 模式
     verbose: bool,
+    /// 工具使用历史（记录每个工具的使用次数）
+    tool_usage: std.StringHashMap(u32),
+    /// 最近使用的工具列表（按时间排序）
+    recent_tools: std.ArrayList([]const u8),
+    /// 动态工具选择策略
+    enable_dynamic_tools: bool,
+    /// 始终发送的核心工具列表
+    core_tools: []const []const u8,
 
     /// 初始化 Handler（使用默认的工具调度器）
     pub fn init(allocator: Allocator, config: HandlerConfig) !Handler {
@@ -141,6 +149,10 @@ pub const Handler = struct {
             .last_response_text = "",
             .empty_response_count = 0,
             .verbose = config.verbose orelse true,
+            .tool_usage = std.StringHashMap(u32).init(allocator),
+            .recent_tools = std.ArrayList([]const u8).init(allocator),
+            .enable_dynamic_tools = config.enable_dynamic_tools orelse true,
+            .core_tools = &[_][]const u8{ "exit", "working_memory_set", "working_memory_get" },
         };
 
         // 创建默认的工具调度器，自动注册文件操作工具
@@ -167,6 +179,10 @@ pub const Handler = struct {
             .last_response_text = "",
             .empty_response_count = 0,
             .verbose = config.verbose orelse true,
+            .tool_usage = std.StringHashMap(u32).init(allocator),
+            .recent_tools = std.ArrayList([]const u8).init(allocator),
+            .enable_dynamic_tools = config.enable_dynamic_tools orelse true,
+            .core_tools = &[_][]const u8{ "exit", "working_memory_set", "working_memory_get" },
         };
     }
 
@@ -191,6 +207,19 @@ pub const Handler = struct {
             self.allocator.free(item);
         }
         self.history_info.deinit();
+
+        // 释放工具使用历史
+        var tool_it = self.tool_usage.iterator();
+        while (tool_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.tool_usage.deinit();
+
+        // 释放最近使用的工具列表
+        for (self.recent_tools.items) |tool| {
+            self.allocator.free(tool);
+        }
+        self.recent_tools.deinit();
 
         // 释放 next_prompt
         if (self.next_prompt) |p| {
@@ -274,6 +303,9 @@ pub const Handler = struct {
     ) StepOutcome {
         self.current_turn += 1;
 
+        // 记录工具使用
+        self.recordToolUsage(tool_name);
+
         // 如果没有设置 dispatcher，创建默认的
         if (self.dispatcher == null) {
             self.createDefaultDispatcher() catch {};
@@ -346,11 +378,26 @@ pub const Handler = struct {
             if (tool_result.data) |data| {
                 switch (data) {
                     .text => {
-                        result_text = data.text;
+                        // 复制数据，因为 tool_result.deinit 会释放这段内存
+                        const dupe_result = self.allocator.dupe(u8, data.text) catch null;
+                        if (dupe_result) |dup| {
+                            result_text = dup;
+                            result_owned = true;
+                        } else {
+                            result_text = data.text;
+                            result_owned = false;
+                        }
                     },
                     .value => |val| {
                         if (val == .string) {
-                            result_text = val.string;
+                            const dupe_result = self.allocator.dupe(u8, val.string) catch null;
+                            if (dupe_result) |dup| {
+                                result_text = dup;
+                                result_owned = true;
+                            } else {
+                                result_text = val.string;
+                                result_owned = false;
+                            }
                         } else {
                             const converted = json.stringifyAlloc(self.allocator, val, .{}) catch "";
                             if (converted.len > 0) {
@@ -863,6 +910,254 @@ pub const Handler = struct {
             .result = value,
         };
     }
+
+    // ================================================================
+    // 动态工具选择相关函数
+    // ================================================================
+
+    /// 记录工具使用
+    pub fn recordToolUsage(self: *Handler, tool_name: []const u8) void {
+        if (self.verbose) {
+            std.log.info("[token-opt] 记录工具使用: {s}", .{tool_name});
+        }
+
+        // 更新使用次数
+        const result = self.tool_usage.getOrPut(tool_name) catch return;
+        if (!result.found_existing) {
+            result.key_ptr.* = self.allocator.dupe(u8, tool_name) catch return;
+            result.value_ptr.* = 0;
+            if (self.verbose) {
+                std.log.info("[token-opt]   首次使用该工具", .{});
+            }
+        }
+        result.value_ptr.* += 1;
+
+        if (self.verbose) {
+            std.log.info("[token-opt]   使用次数: {d}", .{result.value_ptr.*});
+        }
+
+        // 更新最近使用的工具列表
+        // 先检查是否已经存在
+        var found = false;
+        for (self.recent_tools.items) |tool| {
+            if (std.mem.eql(u8, tool, tool_name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            const owned_name = self.allocator.dupe(u8, tool_name) catch return;
+            self.recent_tools.append(owned_name) catch {
+                self.allocator.free(owned_name);
+            };
+            if (self.verbose) {
+                std.log.info("[token-opt]   添加到最近使用列表", .{});
+            }
+            // 限制最近使用的工具数量为 10
+            if (self.recent_tools.items.len > 10) {
+                const removed = self.recent_tools.orderedRemove(0);
+                if (self.verbose) {
+                    std.log.info("[token-opt]   移除最久未使用工具: {s}", .{removed});
+                }
+                self.allocator.free(removed);
+            }
+            if (self.verbose) {
+                std.log.info("[token-opt]   最近使用工具列表: [", .{});
+                for (self.recent_tools.items, 0..) |tool, i| {
+                    std.log.info("[token-opt]     {d}. {s}", .{ i + 1, tool });
+                }
+                std.log.info("[token-opt]   ]", .{});
+            }
+        } else if (self.verbose) {
+            std.log.info("[token-opt]   工具已在最近使用列表中", .{});
+        }
+    }
+
+    /// 检查工具是否是核心工具
+    fn isCoreTool(self: *Handler, tool_name: []const u8) bool {
+        for (self.core_tools) |core_tool| {
+            if (std.mem.eql(u8, tool_name, core_tool)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// 检查工具是否最近使用过
+    fn isRecentlyUsed(self: *Handler, tool_name: []const u8) bool {
+        for (self.recent_tools.items) |tool| {
+            if (std.mem.eql(u8, tool, tool_name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// 获取动态选择的工具定义
+    pub fn getFilteredToolDefinitions(
+        self: *Handler,
+        allocator: Allocator,
+        max_tools: u32,
+    ) []const ToolDefinition {
+        // 如果不启用动态工具选择，返回所有工具
+        if (!self.enable_dynamic_tools) {
+            return self.getToolDefinitions(allocator);
+        }
+
+        // 获取所有工具定义
+        const all_tools = self.getToolDefinitions(allocator);
+        defer allocator.free(all_tools);
+
+        var selected = std.ArrayList(ToolDefinition).init(allocator);
+        defer selected.deinit();
+
+        if (self.verbose) {
+            std.log.info("[token-opt] === 动态工具选择开始 ===", .{});
+            std.log.info("[token-opt] 目标工具数: {d}, 可用工具: {d}", .{ max_tools, all_tools.len });
+        }
+
+        // 首先添加所有核心工具
+        if (self.verbose) {
+            std.log.info("[token-opt] [阶段1] 添加核心工具...", .{});
+        }
+        var core_tools_added: usize = 0;
+        for (all_tools) |tool| {
+            if (self.isCoreTool(tool.name)) {
+                selected.append(.{
+                    .name = tool.name,
+                    .description = tool.description,
+                    .parameters = tool.parameters,
+                }) catch continue;
+                core_tools_added += 1;
+                if (self.verbose) {
+                    std.log.info("[token-opt]   ✓ 添加核心工具: {s}", .{tool.name});
+                }
+            }
+        }
+        if (self.verbose) {
+            std.log.info("[token-opt] 核心工具添加完成: {d} 个", .{core_tools_added});
+        }
+
+        // 然后添加最近使用的工具
+        if (self.verbose) {
+            std.log.info("[token-opt] [阶段2] 添加最近使用的工具...", .{});
+        }
+        var recent_tools_added: usize = 0;
+        for (all_tools) |tool| {
+            if (!self.isCoreTool(tool.name) and self.isRecentlyUsed(tool.name)) {
+                selected.append(.{
+                    .name = tool.name,
+                    .description = tool.description,
+                    .parameters = tool.parameters,
+                }) catch continue;
+                recent_tools_added += 1;
+                const usage_count = self.tool_usage.get(tool.name) orelse 0;
+                if (self.verbose) {
+                    std.log.info("[token-opt]   ✓ 添加最近使用工具: {s} (使用 {d} 次)", .{ tool.name, usage_count });
+                }
+            }
+        }
+        if (self.verbose) {
+            std.log.info("[token-opt] 最近使用工具添加完成: {d} 个", .{recent_tools_added});
+        }
+
+        // 如果还没有达到最大工具数，添加一些常用工具（按使用次数排序）
+        const ToolUsageCount = struct {
+            name: []const u8,
+            count: u32,
+        };
+
+        var remaining_slots: isize = @as(isize, @intCast(max_tools)) - @as(isize, @intCast(selected.items.len));
+        if (self.verbose) {
+            std.log.info("[token-opt] [阶段3] 剩余可用工具槽位: {d}", .{remaining_slots});
+        }
+
+        var popular_tools_added: usize = 0;
+        if (remaining_slots > 0) {
+            if (self.verbose) {
+                std.log.info("[token-opt] 添加常用工具（按使用次数排序）...", .{});
+            }
+
+            // 创建一个按使用次数排序的工具列表
+            var usage_list = std.ArrayList(ToolUsageCount).init(allocator);
+            defer usage_list.deinit();
+
+            for (all_tools) |tool| {
+                if (!self.isCoreTool(tool.name) and !self.isRecentlyUsed(tool.name)) {
+                    const count = self.tool_usage.get(tool.name) orelse 0;
+                    usage_list.append(.{
+                        .name = tool.name,
+                        .count = count,
+                    }) catch continue;
+                }
+            }
+
+            // 按使用次数降序排序
+            std.mem.sort(
+                ToolUsageCount,
+                usage_list.items,
+                {},
+                struct {
+                    fn lessThan(_: void, a: ToolUsageCount, b: ToolUsageCount) bool {
+                        return a.count > b.count;
+                    }
+                }.lessThan,
+            );
+
+            // 添加剩余的工具
+            for (usage_list.items) |item| {
+                if (remaining_slots <= 0) break;
+                // 找到对应的工具定义
+                for (all_tools) |tool| {
+                    if (std.mem.eql(u8, tool.name, item.name)) {
+                        selected.append(.{
+                            .name = tool.name,
+                            .description = tool.description,
+                            .parameters = tool.parameters,
+                        }) catch continue;
+                        popular_tools_added += 1;
+                        if (self.verbose) {
+                            std.log.info("[token-opt]   ✓ 添加常用工具: {s} (使用 {d} 次)", .{ tool.name, item.count });
+                        }
+                        remaining_slots -= 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (self.verbose) {
+            std.log.info("[token-opt] 常用工具添加完成: {d} 个", .{popular_tools_added});
+        }
+
+        // 计算 Token 节省估算
+        if (self.verbose) {
+            var total_all_chars: usize = 0;
+            var total_selected_chars: usize = 0;
+
+            for (all_tools) |tool| {
+                total_all_chars += tool.name.len;
+                total_all_chars += tool.description.len;
+                total_all_chars += tool.parameters.len;
+            }
+
+            for (selected.items) |tool| {
+                total_selected_chars += tool.name.len;
+                total_selected_chars += tool.description.len;
+                total_selected_chars += tool.parameters.len;
+            }
+
+            const saved_chars: isize = @as(isize, @intCast(total_all_chars)) - @as(isize, @intCast(total_selected_chars));
+            const estimated_saved_tokens = @divTrunc(saved_chars, 3); // 约 3 字符 = 1 token
+
+            std.log.info("[token-opt] === 动态工具选择完成 ===", .{});
+            std.log.info("[token-opt] 最终工具数: {d}/{d}", .{ selected.items.len, all_tools.len });
+            std.log.info("[token-opt] 工具定义字符: {d} → {d} (节省 {d})", .{ total_all_chars, total_selected_chars, saved_chars });
+            std.log.info("[token-opt] 估计节省 Token: ~{d}", .{estimated_saved_tokens});
+        }
+
+        return selected.toOwnedSlice() catch &[_]ToolDefinition{};
+    }
 };
 
 // ============================================================================
@@ -881,6 +1176,9 @@ pub const HandlerConfig = struct {
     system_prompt: ?[]const u8 = null,
     /// 是否启用详细日志
     verbose: ?bool = null,
+    /// 是否启用动态工具选择（默认 true，节省 Token）
+    /// 设置为 false 发送所有工具
+    enable_dynamic_tools: ?bool = null,
 };
 
 // ============================================================================

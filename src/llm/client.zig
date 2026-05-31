@@ -220,6 +220,8 @@ pub const LlmClient = struct {
             return LlmError.ConnectionFailed;
         };
 
+        std.log.debug("HTTP POST request to: {s} (body size {})", .{ url, body.len });
+
         var req_buf: [16 * 1024]u8 = undefined;
         var client = http.Client{ .allocator = self.allocator };
         defer client.deinit();
@@ -254,27 +256,28 @@ pub const LlmClient = struct {
             .extra_headers = extra_headers_list.items,
             .redirect_behavior = .not_allowed,
         }) catch |err| {
-            std.log.err("HTTP client open failed: {}", .{err});
+            std.log.err("HTTP client open failed for '{s}': {}", .{ url, err });
             return LlmError.ConnectionFailed;
         };
         defer result.deinit();
 
         result.transfer_encoding = .{ .content_length = body.len };
         result.send() catch |err| {
-            std.log.err("HTTP send failed: {}", .{err});
+            std.log.err("HTTP send failed for '{s}': {}", .{ url, err });
             return LlmError.ConnectionFailed;
         };
         _ = result.writeAll(body) catch |err| {
-            std.log.err("HTTP write body failed: {}", .{err});
+            std.log.err("HTTP write body failed for '{s}': {}", .{ url, err });
             return LlmError.ConnectionFailed;
         };
         result.finish() catch |err| {
-            std.log.err("HTTP finish failed: {}", .{err});
+            std.log.err("HTTP finish failed for '{s}': {}", .{ url, err });
             return LlmError.ConnectionFailed;
         };
 
         result.wait() catch |err| {
-            std.log.err("HTTP wait failed: {}", .{err});
+            std.log.err("HTTP wait failed for '{s}': {}", .{ url, err });
+            std.log.err("Request body that caused error (first 2048 bytes): (not shown)", .{});
             return LlmError.ConnectionFailed;
         };
 
@@ -293,33 +296,28 @@ pub const LlmClient = struct {
                 err_body.appendSlice(rb[0..n]) catch break;
             }
             if (err_body.items.len > 0) {
-                std.debug.print("ERROR BODY: {s}\n", .{err_body.items});
+                std.log.err("HTTP error response: {s}", .{err_body.items});
             } else {
-                std.debug.print("ERROR BODY: (empty)\n", .{});
+                std.log.err("HTTP error response: (empty)", .{});
             }
             return LlmError.HttpError;
         }
 
         // 读取响应体
-        std.debug.print("DEBUG: Starting to read response body\n", .{});
         var response_body = std.ArrayList(u8).init(self.allocator);
         defer response_body.deinit();
 
         var read_buf: [8192]u8 = undefined;
-        var total_read: usize = 0;
         while (true) {
-            std.debug.print("DEBUG: Calling result.read()...\n", .{});
             const n = result.read(&read_buf) catch |err| {
-                std.debug.print("DEBUG: result.read() failed: {}\n", .{err});
+                std.log.err("Response read error: {}", .{err});
                 return LlmError.InvalidResponse;
             };
-            std.debug.print("DEBUG: result.read() returned n={d}\n", .{n});
             if (n == 0) break;
             response_body.appendSlice(read_buf[0..n]) catch
                 return LlmError.AllocationFailed;
-            total_read += n;
         }
-        std.debug.print("DEBUG: Finished reading {d} bytes\n", .{total_read});
+        std.log.debug("HTTP response {} ({} bytes)", .{ status, response_body.items.len });
 
         return .{
             .status_code = @intCast(status),
@@ -414,9 +412,9 @@ pub const LlmClient = struct {
                 err_body.appendSlice(rb[0..n]) catch break;
             }
             if (err_body.items.len > 0) {
-                std.debug.print("ERROR BODY: {s}\n", .{err_body.items});
+                std.log.err("HTTP error response: {s}", .{err_body.items});
             } else {
-                std.debug.print("ERROR BODY: (empty)\n", .{});
+                std.log.err("HTTP error response: (empty)", .{});
             }
             return LlmError.HttpError;
         }

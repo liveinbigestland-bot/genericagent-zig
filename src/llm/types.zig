@@ -49,6 +49,9 @@ pub const ContentBlockTag = enum {
 pub const ContentBlock = struct {
     tag: ContentBlockTag,
 
+    /// thinking 内容（每个块都可能有）
+    thinking: ?[]const u8 = null,
+
     /// text / thinking 共用
     text: ?[]const u8 = null,
 
@@ -68,6 +71,7 @@ pub const ContentBlock = struct {
     data: ?[]const u8 = null,
 
     pub fn deinit(self: *ContentBlock, allocator: Allocator) void {
+        if (self.thinking) |t| allocator.free(t);
         if (self.text) |t| allocator.free(t);
         if (self.id) |v| allocator.free(v);
         if (self.name) |v| allocator.free(v);
@@ -134,6 +138,7 @@ pub const Message = struct {
 fn freeJsonValue(value: *json.Value, allocator: Allocator) void {
     switch (value.*) {
         .string => |s| allocator.free(s),
+        .number_string => |s| allocator.free(s),
         .array => |*arr| {
             for (arr.items) |*item| freeJsonValue(item, allocator);
             allocator.free(arr.items);
@@ -205,12 +210,18 @@ pub const StopReason = enum {
 pub const MockResponse = struct {
     thinking: ?[]const u8 = null,
     content: ?[]const u8 = null,
+    content_blocks: ?[]ContentBlock = null,
     tool_calls: ?[]ToolCall = null,
     stop_reason: StopReason = .end_turn,
+    usage: Usage = .{},
 
     pub fn deinit(self: *MockResponse, allocator: Allocator) void {
         if (self.thinking) |v| allocator.free(v);
         if (self.content) |v| allocator.free(v);
+        if (self.content_blocks) |blocks| {
+            for (blocks) |*b| b.deinit(allocator);
+            allocator.free(blocks);
+        }
         if (self.tool_calls) |calls| {
             for (calls) |*c| c.deinit(allocator);
             allocator.free(calls);

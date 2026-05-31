@@ -86,6 +86,18 @@ pub fn main() !void {
         // 显示结果
         if (result.response) |resp| {
             try stdout.print("\n{s}\n", .{resp});
+
+            // 检查是否包含退出关键词
+            const lower_buf = allocator.alloc(u8, resp.len) catch continue;
+            defer allocator.free(lower_buf);
+            const lower = std.ascii.lowerString(lower_buf, resp);
+            if (std.mem.indexOf(u8, lower, "再见") != null or
+                std.mem.indexOf(u8, lower, "goodbye") != null or
+                std.mem.indexOf(u8, lower, "bye") != null)
+            {
+                try stdout.print("{s}\n", .{str.goodbye});
+                break;
+            }
         }
     }
 }
