@@ -33,23 +33,46 @@ jobs:
           python-version: '3.x'
 
       - name: Build project
+        shell: bash
         run: |
           echo "=== Building project ==="
-          zig build 2>&1
-          BUILD_EXIT_CODE=$?
+          set -o pipefail
+          zig build 2>&1 | tee build.log
+          BUILD_EXIT_CODE=${PIPESTATUS[0]}
           echo "Build exit code: $BUILD_EXIT_CODE"
           if [ $BUILD_EXIT_CODE -ne 0 ]; then
-            echo "Build failed with exit code $BUILD_EXIT_CODE"
-            exit $BUILD_EXIT_CODE
+            echo "::error::Build failed with exit code $BUILD_EXIT_CODE"
           fi
+          exit $BUILD_EXIT_CODE
+
+      - name: Upload build log
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log-${{ matrix.os }}
+          path: build.log
+          retention-days: 30
 
       - name: Run all unit tests
+        shell: bash
         run: |
           echo "=== Running all unit tests ==="
-          zig build test-all --summary all 2>&1
-          TEST_EXIT_CODE=$?
+          set -o pipefail
+          zig build test-all 2>&1 | tee test.log
+          TEST_EXIT_CODE=${PIPESTATUS[0]}
           echo "Test exit code: $TEST_EXIT_CODE"
+          if [ $TEST_EXIT_CODE -ne 0 ]; then
+            echo "::error::Tests failed with exit code $TEST_EXIT_CODE"
+          fi
           exit $TEST_EXIT_CODE
+
+      - name: Upload test log
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-log-${{ matrix.os }}
+          path: test.log
+          retention-days: 30
 
   lint:
     runs-on: ubuntu-latest
