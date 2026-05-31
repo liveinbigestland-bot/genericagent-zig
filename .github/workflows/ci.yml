@@ -32,18 +32,22 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Verify environments
-        run: |
-          echo "=== Environment Info ==="
-          zig version
-          python --version
-          echo "======================="
-
       - name: Build project
         run: zig build
 
-      - name: Run all unit tests
-        run: zig build test-all --summary all
+      - name: Run unit tests (excluding web_ops which require network)
+        run: |
+          echo "Running code_run tests..."
+          zig build test-code-run --summary all
+          echo "Running file_ops tests..."
+          zig build test-file-ops --summary all
+          echo "Running memory_ops tests..."
+          zig build test-memory-ops --summary all
+          echo "Running tools tests..."
+          zig build test-tools --summary all
+
+      - name: Run web_ops tests
+        run: zig build test-web-ops --summary all
 
   lint:
     runs-on: ubuntu-latest
