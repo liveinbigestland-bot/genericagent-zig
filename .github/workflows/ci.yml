@@ -35,13 +35,17 @@ jobs:
       - name: Build project
         run: zig build
 
-      - name: Run all unit tests (verbose)
-        run: zig build test-all --summary all 2>&1 || true
-
-      - name: Check test results
+      - name: Run all unit tests
+        shell: bash
         run: |
-          echo "Checking test output..."
-          zig build test-all --summary all
+          echo "Running tests..."
+          zig build test-all --summary all 2>&1
+          exit_code=$?
+          echo "Test exit code: $exit_code"
+          if [ $exit_code -ne 0 ]; then
+            echo "Tests failed, but continuing to show output"
+          fi
+          exit $exit_code
 
   lint:
     runs-on: ubuntu-latest
