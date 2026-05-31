@@ -237,7 +237,6 @@ pub const SseParser = struct {
                 }
             }
             self.started = true;
-
         } else if (std.mem.eql(u8, type_str, "content_block_start")) {
             // 开始新的内容块
             if (value.getObject("content_block")) |block| {
@@ -264,7 +263,6 @@ pub const SseParser = struct {
                     try self.appendNewBlock(.tool_use, "", tool_name, tool_id, -1);
                 }
             }
-
         } else if (std.mem.eql(u8, type_str, "content_block_delta")) {
             // 增量内容
             if (value.getObject("delta")) |delta| {
@@ -279,7 +277,6 @@ pub const SseParser = struct {
                     try self.appendToBlock(index, .tool_use, delta.getString("partial_json") orelse "");
                 }
             }
-
         } else if (std.mem.eql(u8, type_str, "content_block_stop")) {
             // 内容块结束，无需特殊处理
 
@@ -294,7 +291,6 @@ pub const SseParser = struct {
                     self.response.usage.output_tokens = @intCast(n);
                 }
             }
-
         } else if (std.mem.eql(u8, type_str, "message_stop")) {
             // 消息结束
 

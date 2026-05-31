@@ -1,7 +1,7 @@
 //! src/llm/protocol.zig - 协议转换
 //!
 //! 提供 Claude 和 OpenAI 消息格式之间的双向转换，以及消息修复和
-//! 历史压缩功能。
+//! 历史压缩功能。同时提供结构体到 JSON 的序列化函数，供会话模块使用。
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -14,6 +14,7 @@ const ContentBlock = types.ContentBlock;
 const ContentBlockTag = types.ContentBlockTag;
 const Role = types.Role;
 const ToolDefinition = types.ToolDefinition;
+const ToolCall = types.ToolCall;
 
 // ---------------------------------------------------------------------------
 // Claude -> OpenAI 消息格式转换
@@ -864,4 +865,350 @@ pub fn messagesToOaiJson(
     }
 
     return json.Value.array(arr);
+}
+
+// ---------------------------------------------------------------------------
+// 会话模块辅助函数 - ContentBlock 追加到 JSON 字符串
+// ---------------------------------------------------------------------------
+
+/// 将 ContentBlock 追加到 Claude 格式的 JSON 字符串
+pub fn appendContentBlockClaude(array: *std.ArrayList(u8), block: ContentBlock, allocator: Allocator) !void {
+    switch (block.tag) {
+        .text => {
+            try array.appendSlice("{\"type\":\"text\",\"thinking\":\"");
+            if (block.thinking) |thinking| try appendJsonStringArray(array, thinking);
+            try array.appendSlice("\",\"text\":\"");
+            if (block.text) |text| try appendJsonStringArray(array, text);
+            try array.appendSlice("\"}");
+        },
+        .thinking => {
+            try array.appendSlice("{\"type\":\"thinking\",\"thinking\":\"");
+            if (block.thinking) |thinking| try appendJsonStringArray(array, thinking);
+            try array.appendSlice("\",\"text\":\"");
+            if (block.text) |text| try appendJsonStringArray(array, text);
+            try array.appendSlice("\"}");
+        },
+        .tool_use => {
+            try array.appendSlice("{\"type\":\"tool_use\",\"thinking\":\"");
+            if (block.thinking) |thinking| try appendJsonStringArray(array, thinking);
+            try array.appendSlice("\",\"id\":\"");
+            if (block.id) |id| try appendJsonStringArray(array, id);
+            try array.appendSlice("\",\"name\":\"");
+            if (block.name) |name| try appendJsonStringArray(array, name);
+            try array.appendSlice("\",\"input\":");
+            if (block.input) |input| {
+                // 使用 std.json.stringify，但禁用 UTF-8 验证
+                const args_json = try std.json.stringifyAlloc(allocator, input, .{ .emit_strings_as_arrays = true });
+                defer allocator.free(args_json);
+                try array.appendSlice(args_json);
+            } else {
+                try array.appendSlice("{}");
+            }
+            try array.appendSlice("}");
+        },
+        .image => {
+            try array.appendSlice("{\"type\":\"image\",\"thinking\":\"");
+            if (block.thinking) |thinking| try appendJsonStringArray(array, thinking);
+            try array.appendSlice("\",\"source\":{\"type\":\"base64\",\"media_type\":\"");
+            if (block.media_type) |media_type| try appendJsonStringArray(array, media_type);
+            try array.appendSlice("\",\"data\":\"");
+            if (block.data) |data| try appendJsonStringArray(array, data);
+            try array.appendSlice("\"}}");
+        },
+        .tool_result => {
+            try array.appendSlice("{\"type\":\"tool_result\",\"thinking\":\"");
+            if (block.thinking) |thinking| try appendJsonStringArray(array, thinking);
+            try array.appendSlice("\",\"tool_use_id\":\"");
+            if (block.tool_use_id) |tool_use_id| try appendJsonStringArray(array, tool_use_id);
+            try array.appendSlice("\",\"content\":\"");
+            if (block.content) |content| try appendJsonStringArray(array, content);
+            try array.appendSlice("\"}");
+        },
+    }
+}
+
+/// 将 ContentBlock 追加到 OpenAI 格式的 JSON 字符串
+pub fn appendContentBlockOai(array: *std.ArrayList(u8), block: ContentBlock, allocator: Allocator) !void {
+    switch (block.tag) {
+        .text, .thinking => {
+            try array.appendSlice("{\"type\":\"text\",\"text\":\"");
+            if (block.text) |text| try appendJsonStringArray(array, text);
+            try array.appendSlice("\"}");
+        },
+        .tool_use => {
+            try array.appendSlice("{\"tool_call\":{\"id\":\"");
+            if (block.id) |id| try appendJsonStringArray(array, id);
+            try array.appendSlice("\",\"type\":\"function\",\"function\":{\"name\":\"");
+            if (block.name) |name| try appendJsonStringArray(array, name);
+            try array.appendSlice("\",\"arguments\":");
+            if (block.input) |input| {
+                const args_json = try std.json.stringifyAlloc(allocator, input, .{});
+                defer allocator.free(args_json);
+                try array.appendSlice(args_json);
+            } else {
+                try array.appendSlice("{}");
+            }
+            try array.appendSlice("}}}");
+        },
+        .image => {
+            try array.appendSlice("{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
+            if (block.media_type) |media_type| try appendJsonStringArray(array, media_type);
+            try array.appendSlice(";base64,");
+            if (block.data) |data| try appendJsonStringArray(array, data);
+            try array.appendSlice("\"}}");
+        },
+        .tool_result => {
+            try array.appendSlice("{\"type\":\"text\",\"text\":\"");
+            if (block.content) |content| try appendJsonStringArray(array, content);
+            try array.appendSlice("\"}");
+        },
+    }
+}
+
+/// 追加 JSON 字符串到 ArrayList（转义特殊字符）
+pub fn appendJsonStringArray(array: *std.ArrayList(u8), input: []const u8) !void {
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        const c = input[i];
+        switch (c) {
+            '"' => try array.appendSlice("\\\""),
+            '\\' => try array.appendSlice("\\\\"),
+            '\n' => try array.appendSlice("\\n"),
+            '\r' => try array.appendSlice("\\r"),
+            '\t' => try array.appendSlice("\\t"),
+            '\x08' => try array.appendSlice("\\b"),
+            '\x0C' => try array.appendSlice("\\f"),
+            else => {
+                if (c < 0x80) {
+                    // ASCII 字符直接添加
+                    if (c >= 0x20 or c == '\t') {
+                        try array.append(c);
+                    } else {
+                        // 控制字符使用 \uXXXX 转义
+                        const hex_str = try std.fmt.allocPrint(array.allocator, "\\u{:0>4}", .{std.fmt.fmtSliceHexUpper(&[_]u8{c})});
+                        defer array.allocator.free(hex_str);
+                        try array.appendSlice(hex_str);
+                    }
+                } else {
+                    // UTF-8 多字节字符处理
+                    const len: usize = if (c < 0xE0) 2 else if (c < 0xF0) 3 else if (c < 0xF8) 4 else {
+                        // 无效的 UTF-8 起始字节，用替换字符 U+FFFD 替代
+                        try array.appendSlice("\\uFFFD");
+                        continue;
+                    };
+                    if (i + len > input.len) {
+                        // 不完整的 UTF-8 序列，用替换字符替代
+                        try array.appendSlice("\\uFFFD");
+                        continue;
+                    }
+                    var valid = true;
+                    var j: usize = 1;
+                    while (j < len) : (j += 1) {
+                        if ((input[i + j] & 0xC0) != 0x80) {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    if (valid) {
+                        // 验证是否为有效的 Unicode 码点
+                        const code_point = decodeUtf8(input[i .. i + len]);
+                        if (code_point != null and isValidUnicode(code_point.?)) {
+                            try array.appendSlice(input[i .. i + len]);
+                        } else {
+                            try array.appendSlice("\\uFFFD");
+                        }
+                    } else {
+                        // 无效的 UTF-8 序列，用替换字符替代
+                        try array.appendSlice("\\uFFFD");
+                    }
+                    i += len - 1; // 主循环会再 +1
+                }
+            },
+        }
+    }
+}
+
+/// 解码 UTF-8 字节序列为 Unicode 码点
+fn decodeUtf8(bytes: []const u8) ?u32 {
+    if (bytes.len == 0) return null;
+    const first = bytes[0];
+    if (first < 0x80) {
+        return first;
+    } else if (first < 0xE0 and bytes.len >= 2) {
+        return @as(u32, (first & 0x1F)) << 6 | @as(u32, bytes[1] & 0x3F);
+    } else if (first < 0xF0 and bytes.len >= 3) {
+        return @as(u32, (first & 0x0F)) << 12 | @as(u32, bytes[1] & 0x3F) << 6 | @as(u32, bytes[2] & 0x3F);
+    } else if (first < 0xF8 and bytes.len >= 4) {
+        return @as(u32, (first & 0x07)) << 18 | @as(u32, bytes[1] & 0x3F) << 12 | @as(u32, bytes[2] & 0x3F) << 6 | @as(u32, bytes[3] & 0x3F);
+    }
+    return null;
+}
+
+/// 检查 Unicode 码点是否有效
+fn isValidUnicode(code_point: u32) bool {
+    // 排除代理对区域 (U+D800 - U+DFFF)
+    if (code_point >= 0xD800 and code_point <= 0xDFFF) return false;
+    // 排除非字符区域
+    if (code_point >= 0xFDD0 and code_point <= 0xFDEF) return false;
+    // 排除超出 Unicode 范围的码点
+    if (code_point > 0x10FFFF) return false;
+    return true;
+}
+
+/// 安全地序列化 JSON 值到 ArrayList（跳过无效字符）
+fn appendJsonValueSafe(array: *std.ArrayList(u8), value: json.Value, allocator: Allocator) !void {
+    switch (value) {
+        .null => try array.appendSlice("null"),
+        .bool => |b| if (b) try array.appendSlice("true") else try array.appendSlice("false"),
+        .integer => |i| try std.fmt.format(array.writer(), "{}", .{i}),
+        .float => |f| try std.fmt.format(array.writer(), "{}", .{f}),
+        .number_string => |s| {
+            try array.append('"');
+            if (s.len > 0) try appendJsonStringArray(array, s);
+            try array.append('"');
+        },
+        .string => |s| {
+            try array.append('"');
+            if (s.len > 0) try appendJsonStringArray(array, s);
+            try array.append('"');
+        },
+        .array => |arr| {
+            try array.append('[');
+            for (arr.items, 0..) |item, idx| {
+                if (idx > 0) try array.append(',');
+                try appendJsonValueSafe(array, item, allocator);
+            }
+            try array.append(']');
+        },
+        .object => |obj| {
+            try array.append('{');
+            var it = obj.iterator();
+            var first = true;
+            while (it.next()) |entry| {
+                if (!first) try array.append(',');
+                first = false;
+                try array.append('"');
+                if (entry.key_ptr.*.len > 0) try appendJsonStringArray(array, entry.key_ptr.*);
+                try array.appendSlice("\":");
+                try appendJsonValueSafe(array, entry.value_ptr.*, allocator);
+            }
+            try array.append('}');
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 会话模块辅助函数 - JSON 值复制
+// ---------------------------------------------------------------------------
+
+/// 深度复制 JSON 值
+pub fn cloneJsonValue(allocator: Allocator, value: json.Value) !json.Value {
+    return switch (value) {
+        .null => .null,
+        .bool => |b| .{ .bool = b },
+        .integer => |i| .{ .integer = i },
+        .float => |f| .{ .float = f },
+        .string => |s| .{ .string = try allocator.dupe(u8, s) },
+        .number_string => |s| .{ .number_string = try allocator.dupe(u8, s) },
+        .array => |arr| blk: {
+            var new_array_list = std.ArrayList(json.Value).init(allocator);
+            errdefer new_array_list.deinit();
+            for (arr.items) |item| {
+                try new_array_list.append(try cloneJsonValue(allocator, item));
+            }
+            break :blk .{ .array = new_array_list };
+        },
+        .object => |obj| blk: {
+            var new_obj = json.ObjectMap.init(allocator);
+            errdefer new_obj.deinit();
+
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                const key = try allocator.dupe(u8, entry.key_ptr.*);
+                var val = try cloneJsonValue(allocator, entry.value_ptr.*);
+                var put_succeeded = false;
+                errdefer if (!put_succeeded) {
+                    allocator.free(key);
+                    switch (val) {
+                        .string => allocator.free(val.string),
+                        .number_string => allocator.free(val.number_string),
+                        .array => val.array.deinit(),
+                        .object => val.object.deinit(),
+                        else => {},
+                    }
+                };
+                try new_obj.put(key, val);
+                put_succeeded = true;
+                val = undefined; // indicate moved
+            }
+            break :blk .{ .object = new_obj };
+        },
+    };
+}
+
+// ---------------------------------------------------------------------------
+// 会话模块辅助函数 - 响应解析
+// ---------------------------------------------------------------------------
+
+/// 从 Claude 格式的 JSON 对象解析 ToolCall
+pub fn parseToolCallClaude(allocator: Allocator, obj: json.ObjectMap) !ToolCall {
+    var tc: ToolCall = undefined;
+
+    tc.id = if (obj.get("id")) |id_val| blk: {
+        if (id_val == .string) {
+            break :blk try allocator.dupe(u8, id_val.string);
+        }
+        break :blk try allocator.dupe(u8, "");
+    } else try allocator.dupe(u8, "");
+
+    tc.name = if (obj.get("name")) |name_val| blk: {
+        if (name_val == .string) {
+            break :blk try allocator.dupe(u8, name_val.string);
+        }
+        break :blk try allocator.dupe(u8, "");
+    } else try allocator.dupe(u8, "");
+
+    tc.arguments = if (obj.get("input")) |input_val| blk: {
+        // 直接复制 JSON 值，而不是序列化后再解析
+        break :blk try cloneJsonValue(allocator, input_val);
+    } else .null;
+
+    return tc;
+}
+
+/// 从 OpenAI 格式的 JSON 对象解析 ToolCall
+pub fn parseToolCallOai(allocator: Allocator, obj: json.ObjectMap) !ToolCall {
+    var tc: ToolCall = undefined;
+
+    tc.id = if (obj.get("id")) |id_val| blk: {
+        if (id_val == .string) {
+            break :blk try allocator.dupe(u8, id_val.string);
+        }
+        break :blk try allocator.dupe(u8, "");
+    } else try allocator.dupe(u8, "");
+
+    tc.name = if (obj.get("function")) |func_val| blk: {
+        if (func_val == .object) {
+            const func_obj = func_val.object;
+            if (func_obj.get("name")) |name_val| {
+                if (name_val == .string) {
+                    break :blk try allocator.dupe(u8, name_val.string);
+                }
+            }
+        }
+        break :blk try allocator.dupe(u8, "");
+    } else try allocator.dupe(u8, "");
+
+    tc.arguments = if (obj.get("function")) |func_val| blk: {
+        if (func_val == .object) {
+            const func_obj = func_val.object;
+            if (func_obj.get("arguments")) |args_val| {
+                // 直接复制 JSON 值，而不是序列化后再解析
+                break :blk try cloneJsonValue(allocator, args_val);
+            }
+        }
+        break :blk .null;
+    } else .null;
+
+    return tc;
 }
