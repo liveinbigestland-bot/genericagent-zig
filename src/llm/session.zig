@@ -39,25 +39,41 @@ pub fn saveInteractionLog(allocator: Allocator, log_dir: []const u8, turn: u32, 
     };
     defer allocator.free(file_name);
 
+    // 解析 request 和 response 为 JSON 值
+    const request_parsed = std.json.parseFromSlice(std.json.Value, allocator, request, .{}) catch |err| {
+        std.log.err("failed to parse request JSON: {}", .{err});
+        return;
+    };
+    defer request_parsed.deinit();
+
+    const response_parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch |err| {
+        std.log.err("failed to parse response JSON: {}", .{err});
+        return;
+    };
+    defer response_parsed.deinit();
+
+    // 构造日志对象
+    var log_object = std.json.ObjectMap.init(allocator);
+    defer log_object.deinit();
+
+    log_object.put("timestamp", .{ .string = timestamp }) catch return;
+    log_object.put("turn", .{ .integer = @intCast(turn) }) catch return;
+    log_object.put("status_code", .{ .integer = @intCast(status_code) }) catch return;
+    log_object.put("request", request_parsed.value) catch return;
+    log_object.put("response", response_parsed.value) catch return;
+
+    const log_value = std.json.Value{ .object = log_object };
+
+    // 序列化为 JSON 字符串
     var log_content = std.ArrayList(u8).init(allocator);
     defer log_content.deinit();
 
-    log_content.appendSlice("{\"timestamp\":\"") catch return;
-    log_content.appendSlice(timestamp) catch return;
-    log_content.appendSlice("\",\"turn\":") catch return;
-    const turn_str = std.fmt.allocPrint(allocator, "{}", .{turn}) catch return;
-    defer allocator.free(turn_str);
-    log_content.appendSlice(turn_str) catch return;
-    log_content.appendSlice(",\"status_code\":") catch return;
-    const status_str = std.fmt.allocPrint(allocator, "{}", .{status_code}) catch return;
-    defer allocator.free(status_str);
-    log_content.appendSlice(status_str) catch return;
-    log_content.appendSlice(",\"request\":") catch return;
-    log_content.appendSlice(request) catch return;
-    log_content.appendSlice(",\"response\":") catch return;
-    log_content.appendSlice(response) catch return;
-    log_content.appendSlice("}") catch return;
+    std.json.stringify(log_value, .{ .whitespace = .indent_2 }, log_content.writer()) catch |err| {
+        std.log.err("failed to stringify log JSON: {}", .{err});
+        return;
+    };
 
+    // 写入文件
     const file = std.fs.cwd().createFile(file_name, .{ .truncate = true }) catch |err| {
         std.log.err("failed to create log file '{s}': {}", .{ file_name, err });
         return;
@@ -104,6 +120,10 @@ pub const SessionConfig = struct {
     timeout_ms: u32 = 60000,
     enable_logging: bool = false,
     log_dir: []const u8 = "logs",
+    /// DeepSeek 思考模式开关
+    enable_thinking: bool = false,
+    /// DeepSeek 思考强度："high"/"max"
+    reasoning_effort: []const u8 = "high",
 };
 
 // ---------------------------------------------------------------------------

@@ -250,6 +250,7 @@ fn parseClaudeResponse(allocator: Allocator, body: []const u8) !MockResponse {
                 }
                 if (tool_calls.items.len > 0) {
                     response.tool_calls = try tool_calls.toOwnedSlice();
+                    tool_calls.items.len = 0;
                 }
             }
         }

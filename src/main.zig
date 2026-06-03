@@ -36,10 +36,12 @@ pub fn main() !void {
             .api_mode = api_mode,
             .enable_logging = config.enable_logging,
             .log_dir = config.log_dir,
+            .enable_thinking = config.enable_thinking,
+            .reasoning_effort = config.reasoning_effort,
         },
         .cwd = ".",
         .verbose = true,
-        .max_turns = 40,
+        .max_turns = config.max_turns,
     });
     defer ag.deinit();
 
@@ -65,10 +67,13 @@ pub fn main() !void {
 
         const user_input = input.?;
 
+        // 去掉末尾的换行符和空白字符
+        const trimmed_input = std.mem.trim(u8, user_input, "\r\n ");
+
         // 检查退出命令
-        if (std.mem.eql(u8, user_input, "exit") or
-            std.mem.eql(u8, user_input, "quit") or
-            std.mem.eql(u8, user_input, "q"))
+        if (std.mem.eql(u8, trimmed_input, "exit") or
+            std.mem.eql(u8, trimmed_input, "quit") or
+            std.mem.eql(u8, trimmed_input, "q"))
         {
             try stdout.print("{s}\n", .{str.goodbye});
             break;

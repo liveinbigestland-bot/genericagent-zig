@@ -98,6 +98,8 @@ pub const Message = struct {
     content: ?[]const u8 = null,
     /// 结构化内容块列表
     content_blocks: ?[]ContentBlock = null,
+    /// DeepSeek 思考模式：思维链内容
+    reasoning_content: ?[]const u8 = null,
     /// Claude cache_control: {"type": "ephemeral"}
     cache_control: bool = false,
 
@@ -107,6 +109,7 @@ pub const Message = struct {
             for (blocks) |*b| b.deinit(allocator);
             allocator.free(blocks);
         }
+        if (self.reasoning_content) |r| allocator.free(r);
     }
 
     /// 获取用于显示的文本摘要
@@ -212,6 +215,8 @@ pub const MockResponse = struct {
     content: ?[]const u8 = null,
     content_blocks: ?[]ContentBlock = null,
     tool_calls: ?[]ToolCall = null,
+    /// DeepSeek 思考模式：思维链内容
+    reasoning_content: ?[]const u8 = null,
     stop_reason: StopReason = .end_turn,
     usage: Usage = .{},
 
@@ -226,6 +231,7 @@ pub const MockResponse = struct {
             for (calls) |*c| c.deinit(allocator);
             allocator.free(calls);
         }
+        if (self.reasoning_content) |v| allocator.free(v);
     }
 };
 

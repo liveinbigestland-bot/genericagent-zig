@@ -278,6 +278,7 @@ pub fn agentRunnerLoopWithCallbacks(
                 try messages.append(.{
                     .role = msg.role,
                     .content = if (msg.content) |c| try allocator.dupe(u8, c) else null,
+                    .reasoning_content = if (msg.reasoning_content) |rc| try allocator.dupe(u8, rc) else null,
                     .content_blocks = if (msg.content_blocks) |blocks| blk: {
                         const new_blocks = try allocator.alloc(llm_types.ContentBlock, blocks.len);
                         for (blocks, 0..) |block, i| {
@@ -482,6 +483,18 @@ pub fn agentRunnerLoopWithCallbacks(
             }
         }
 
+        // 通知回调：推理内容（DeepSeek 思考模式）
+        if (llm_response.reasoning_content) |reasoning_text| {
+            if (reasoning_text.len > 0) {
+                if (config.verbose) {
+                    std.log.info("[loop] LLM 推理内容: {d} 字符", .{reasoning_text.len});
+                }
+                if (callbacks) |cb| {
+                    cb.on_event(cb.ctx, .{ .thinking = .{ .text = reasoning_text } });
+                }
+            }
+        }
+
         // -----------------------------------------------------------
         // b. 解析响应中的 tool_calls
         // -----------------------------------------------------------
@@ -573,6 +586,10 @@ pub fn agentRunnerLoopWithCallbacks(
             try messages.append(.{
                 .role = .assistant,
                 .content_blocks = blocks_owned,
+                .reasoning_content = if (llm_response.reasoning_content) |rc|
+                    try allocator.dupe(u8, rc)
+                else
+                    null,
             });
         }
 

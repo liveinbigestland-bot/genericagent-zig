@@ -10,6 +10,10 @@ pub const Config = struct {
     log_dir: []const u8 = "logs",
     log_level: []const u8 = "info",
 
+    // DeepSeek 思考模式配置
+    enable_thinking: bool = false,
+    reasoning_effort: []const u8 = "high",
+
     // Agent 循环配置
     max_turns: u32 = 40,
     verbose: bool = true,
@@ -46,6 +50,8 @@ pub const Config = struct {
             .enable_logging = parsed.value.enable_logging,
             .log_dir = try allocator.dupe(u8, parsed.value.log_dir),
             .log_level = try allocator.dupe(u8, parsed.value.log_level),
+            .enable_thinking = parsed.value.enable_thinking,
+            .reasoning_effort = try allocator.dupe(u8, parsed.value.reasoning_effort),
             .max_turns = parsed.value.max_turns,
             .verbose = parsed.value.verbose,
             .enable_sliding_window = parsed.value.enable_sliding_window,
@@ -64,6 +70,7 @@ pub const Config = struct {
         allocator.free(self.language);
         allocator.free(self.log_dir);
         allocator.free(self.log_level);
+        allocator.free(self.reasoning_effort);
     }
 };
 

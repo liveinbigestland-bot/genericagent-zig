@@ -200,9 +200,25 @@ pub fn build(b: *std.Build) void {
     test_web_ops_exe.linkLibC();
 
     const run_test_web_ops = b.addRunArtifact(test_web_ops_exe);
+    run_test_web_ops.setEnvironmentVariable("WEB_OPS_DISABLE_AUTO_LAUNCH", "1");
+    run_test_web_ops.setEnvironmentVariable("WEB_OPS_LOG_DISABLED", "1");
 
     const test_web_ops_step = b.step("test-web-ops", "Run web_ops unit tests");
     test_web_ops_step.dependOn(&run_test_web_ops.step);
+
+    // test_chrome_launch.zig - Chrome 自动启动测试
+    const test_chrome_launch_exe = b.addTest(.{
+        .root_source_file = b.path("tests/test_chrome_launch.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_chrome_launch_exe.root_module.addImport("tools", tools_module);
+    test_chrome_launch_exe.linkLibC();
+
+    const run_test_chrome_launch = b.addRunArtifact(test_chrome_launch_exe);
+
+    const test_chrome_launch_step = b.step("test-chrome-launch", "Test Chrome auto-launch functionality");
+    test_chrome_launch_step.dependOn(&run_test_chrome_launch.step);
 
     // demo_agent_loop.zig 演示程序
     const demo_agent_loop_exe = b.addExecutable(.{
@@ -286,6 +302,35 @@ pub fn build(b: *std.Build) void {
 
     const test_web_scan_step = b.step("test-web-scan", "Run web_scan tool test");
     test_web_scan_step.dependOn(&run_test_web_scan.step);
+
+    // test_concurrent_web_scan.zig —— 并发 web_scan 测试
+    const test_concurrent_web_scan_exe = b.addExecutable(.{
+        .name = "test_concurrent_web_scan",
+        .root_source_file = b.path("test_concurrent_web_scan.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_concurrent_web_scan_exe.root_module.addImport("tools", tools_module);
+    test_concurrent_web_scan_exe.linkLibC();
+
+    const run_test_concurrent_web_scan = b.addRunArtifact(test_concurrent_web_scan_exe);
+
+    const test_concurrent_web_scan_step = b.step("test-concurrent-web-scan", "Test concurrent web_scan requests");
+    test_concurrent_web_scan_step.dependOn(&run_test_concurrent_web_scan.step);
+
+    // test_cdp_diagnostic.zig —— CDP 诊断测试
+    const test_cdp_diagnostic_exe = b.addExecutable(.{
+        .name = "test_cdp_diagnostic",
+        .root_source_file = b.path("test_cdp_diagnostic.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_cdp_diagnostic_exe.linkLibC();
+
+    const run_test_cdp_diagnostic = b.addRunArtifact(test_cdp_diagnostic_exe);
+
+    const test_cdp_diagnostic_step = b.step("test-cdp-diagnostic", "Diagnose CDP endpoint behavior");
+    test_cdp_diagnostic_step.dependOn(&run_test_cdp_diagnostic.step);
 
     // 综合测试步骤 - 运行所有单元测试
     const test_all_step = b.step("test-all", "Run all unit tests");

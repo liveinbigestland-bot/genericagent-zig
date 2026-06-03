@@ -51,9 +51,15 @@ pub const OaiSession = struct {
         try array.appendSlice("\",\"max_tokens\":");
         try session.appendJsonNumber(&array, self.impl.config.max_tokens);
 
-        if (self.impl.config.temperature >= 0) {
+        if (self.impl.config.temperature >= 0 and !self.impl.config.enable_thinking) {
             try array.appendSlice(",\"temperature\":");
             try session.appendJsonFloat(&array, self.impl.config.temperature);
+        }
+
+        if (self.impl.config.enable_thinking) {
+            try array.appendSlice(",\"reasoning_effort\":\"");
+            try protocol.appendJsonStringArray(&array, self.impl.config.reasoning_effort);
+            try array.appendSlice("\",\"extra_body\":{\"thinking\":{\"type\":\"enabled\"}}");
         }
 
         if (tools) |tool_list| {
@@ -76,6 +82,12 @@ pub const OaiSession = struct {
             if (i > 0) try array.appendSlice(",");
             try array.appendSlice("{\"role\":\"");
             try array.appendSlice(msg.role.toString());
+
+            if (msg.reasoning_content) |r| {
+                try array.appendSlice("\",\"reasoning_content\":\"");
+                try protocol.appendJsonStringArray(&array, r);
+            }
+
             try array.appendSlice("\",\"content\":[");
 
             if (msg.content) |c| {
@@ -157,6 +169,11 @@ fn parseOaiResponse(allocator: Allocator, body: []const u8) !MockResponse {
                             if (msg_obj.get("content")) |content_val| {
                                 if (content_val == .string) {
                                     response.content = try allocator.dupe(u8, content_val.string);
+                                }
+                            }
+                            if (msg_obj.get("reasoning_content")) |reasoning_val| {
+                                if (reasoning_val == .string) {
+                                    response.reasoning_content = try allocator.dupe(u8, reasoning_val.string);
                                 }
                             }
                             if (msg_obj.get("tool_calls")) |tool_calls_val| {
